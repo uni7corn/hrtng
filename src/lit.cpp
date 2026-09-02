@@ -20,6 +20,7 @@
 #include "warn_off.h"
 #include <hexrays.hpp>
 #include <diskio.hpp>
+#include <demangle.hpp>
 #if IDA_SDK_VERSION < 850
 #include <enum.hpp>
 #endif // IDA_SDK_VERSION < 850
@@ -37,7 +38,27 @@
 ; 4) empty line
  */
 
-typedef std::map<uint64, qstring> literals_t; // value to literal name map
+typedef uint64 litval_t;
+typedef std::map<litval_t, qstring> literals_t; // value to literal name map
+
+bool a2litval(litval_t* val, const char *str)
+{
+	while(*str == ' ' || *str == '\t')
+		str++;
+	bool negative = false;
+	if(*str == '-') {
+		negative = true;
+		str++;
+	}
+	ea_t n;
+	if(!atoea(&n, str))
+		 return false;
+	if(negative)
+		*val = -(litval_t)n;
+	else
+		*val = (litval_t)n;
+	return true;
+}
 
 struct ida_local lit_arg_t
 {
@@ -67,10 +88,10 @@ class ida_local literal_db
 public:
 
 	lit_func_t find_func(const char* funcname) const {
-		return m_functions.find(funcname); 
+		return m_functions.find(funcname);
 	}
-	bool is_func(const lit_func_t& f) const { 
-		return f != m_functions.end(); 
+	bool is_func(const lit_func_t& f) const {
+		return f != m_functions.end();
 	}
 	const lit_arg_t* find_arg (const lit_func_t& lfunc, uint32 argN) const
 	{
@@ -80,8 +101,8 @@ public:
 		return NULL;
 	}
 
-	lit_struct_t find_struct(const char* strucname) const { 
-		return m_structures.find(strucname); 
+	lit_struct_t find_struct(const char* strucname) const {
+		return m_structures.find(strucname);
 	}
 	bool is_struct(const lit_struct_t& s) const {
 		return s != m_structures.end();
@@ -194,12 +215,11 @@ public:
 			case ldLit:
 				if (len >= 5 && buf[0] == ' ' && buf[1] == ' ') {
 					const char* sp = qstrchr(&buf[2], ' ');
-					if (sp) {
-						ea_t n;
-						if (atoea(&n, sp + 1)) {
-							refs->insert(std::pair<uint64, qstring>(uint64(n), qstring(&buf[2], sp - &buf[2])));
-							break;
-						}
+					litval_t val;
+					if(sp && a2litval(&val, sp + 1)) {
+						if(!refs->insert(std::pair<litval_t, qstring>(val, qstring(&buf[2], sp - &buf[2]))).second)
+							Log(llFlood, "duplicate literal on line %d\n", line);
+						break;
 					}
 				}
 				ll_error(line, "literal expected");
@@ -212,19 +232,29 @@ public:
 
 /*--------------------------------------------------------------------------*/
 static literal_db* lit = NULL;
-static const char* WINERROR = "WINERROR";
+static const char* sWINERROR = "WINERROR";
+static const char* sNTSTATUS = "NTSTATUS";
 
 struct ida_local lit_visitor_t : public ctree_visitor_t
 {
 	cfunc_t *func;
+	tinfo_t return_type;
 	bool cmtModified;
 	user_cmts_t *cmts;
 
-	lit_visitor_t(cfunc_t *cfunc) : ctree_visitor_t(CV_FAST), func(cfunc), cmtModified(false) 
+	lit_visitor_t(cfunc_t *cfunc) : ctree_visitor_t(CV_FAST), func(cfunc), cmtModified(false)
 	{
 		cmts = restore_user_cmts(cfunc->entry_ea);
 		if(cmts == NULL)
 			cmts = user_cmts_new();
+
+		tinfo_t funcType;
+		if(func->get_func_type(&funcType)) {
+			func_type_data_t fti;
+			if(funcType.get_func_details(&fti) && fti.rettype.is_typeref()) {
+				return_type = fti.rettype;
+			}
+		}
 	}
 
 	~lit_visitor_t()
@@ -234,16 +264,17 @@ struct ida_local lit_visitor_t : public ctree_visitor_t
 		user_cmts_free(cmts);
 	}
 	virtual int idaapi visit_expr(cexpr_t *expr);
+	virtual int idaapi visit_insn(cinsn_t *insn);
 	bool chkCallArg(cexpr_t *expr, qstring &comment);
 	bool chkStrucMemb(cexpr_t *memb, cexpr_t *cons, qstring &comment);
-	bool chkConstType(cexpr_t *expr, cexpr_t *cons, qstring &comment);
+	bool chkConstType(tinfo_t& type, cexpr_t *cons, qstring &comment);
 	cexpr_t* getLiteralExp(cexpr_t *constexp, const literals_t& l, bool exclusive);
-	cexpr_t* makeEnumExpr(const char* name, uint64 val, cexpr_t *constexp);
+	cexpr_t* makeEnumExpr(const char* name, litval_t val, cexpr_t *constexp);
 };
 
-static qstring getLiteralString(uint64 val, const literals_t& l, bool exclusive)
+static qstring getLiteralString(litval_t val, const literals_t& l, bool exclusive)
 {
-	uint64 n = val;
+	litval_t n = val;
 	qstring str;
 	auto i = l.find(val);
 	if (i != l.end()) {
@@ -270,7 +301,7 @@ static qstring getLiteralString(uint64 val, const literals_t& l, bool exclusive)
 	return str;
 }
 
-static const char* importEnumFromTil(til_t *til, const char* name, uint64 val)
+static const char* importEnumFromTil(til_t *til, const char* name, litval_t val, uchar *serial)
 {
 	enable_numbered_types(til, true);
 
@@ -291,18 +322,71 @@ static const char* importEnumFromTil(til_t *til, const char* name, uint64 val)
 			if (t.deserialize(til, &type, &fields)) {
 				enum_type_data_t ed;
 				if (t.get_enum_details(&ed)) {
-					for (auto memb = ed.begin(); memb != ed.end(); memb++) {
-						if (val == memb->value && !qstrcmp(name, memb->name.c_str())) {
-							const char* typeName = get_numbered_type_name(til, ordinal);
-							if (typeName) {
-#if IDA_SDK_VERSION < 850
-								import_type(til, -1, typeName);
-								Log(llInfo, "import enum \"%s\" from til \"%s\"\n", typeName, til->name);
-#endif //IDA_SDK_VERSION < 850
-								return typeName;
+					uint64 mask = ed.calc_mask();
+					uint64 vm = val & mask;
+					*serial = 0;
+					for(auto &memb : ed) {
+						if(vm == (memb.value & mask)) {
+							bool match = !qstrcmp(name, memb.name.c_str());
+							if(!match && !strncmp(name, "GWL", 3)) {
+								//HACK GWL_ vs GWLP_ name mismatch. In 64-bit TIL, GWL_USERDATA does not exist - only GWLP_USERDATA.
+								// value matches but name differs, accept if suffix after 1st '_' matches
+								const char* s1 = qstrchr(name, '_');
+								const char* s2 = qstrchr(memb.name.c_str(), '_');
+								if(!qstrcmp(s1, s2)) {
+									match = true;
+									*serial = 0; //reset serial for hack
+								}
 							}
-							Log(llWarning, "not named enum for \"%s\" 0x%x \n", name, val);
-							return NULL;
+							if(match)	{
+								const char* typeName = get_numbered_type_name(til, ordinal);
+								if (typeName && *typeName) {
+									if(til && til != get_idati()) { // nullptr til is the local til
+										Log(llInfo, "import enum '%s' from til '%s'\n", typeName, til->name);
+#if IDA_SDK_VERSION < 850
+										import_type(til, -1, typeName);
+#else //IDA_SDK_VERSION >= 850
+										//enum doesnt work when type doesnt exist in local til
+#if 0
+										//I've not found a way to import original type, two below
+										//gets correctly named `nt`, but fails on `nt.force_tid();` and emums are not shown
+										tinfo_t nt; nt.get_named_type(til, typeName); nt.force_tid();
+										tinfo_t nt; nt.get_numbered_type(til, ordinal); nt.force_tid();
+#elif 0
+										// bad named but working: desirialized `t` is imported with autogenerated name;
+										if(t.force_tid() != BADADDR) {
+											//this `set_named_type` is not required actually - enums may refer to autogenerated name
+											tinfo_code_t code = t.set_named_type(nullptr, typeName, NTF_TYPE | NTF_REPLACE);
+											Log(llDebug, "set_named_type('%s') returns %d\n", typeName, code);
+										}
+#elif 0
+										//INTERR 140 on some enums inside some tils (ex: MACRO_INVALID_HANDLE_VALUE in vc10_64)
+										tinfo_code_t code = t.set_named_type(nullptr, typeName, NTF_TYPE|NTF_REPLACE);
+										if(code != TERR_OK)
+											Log(llDebug, "set_named_type('%s') returns %d\n", typeName, code);
+#elif 0
+										//create a full copy of enum type in local til
+										//the 'copy_type' below does some strange magic, TERR_OK is returned but copied type does not appeared in local til
+										//(and isn't cached in local til, thats slows repeating searching)
+										//INTERR 140 is gone, enums displayed without cache in local til
+										tinfo_code_t code = t.copy_type(nullptr, typeName, NTF_REPLACE);
+										if(code != TERR_OK)
+											Log(llDebug, "copy_type('%s') returns %d\n", typeName, code);
+#else
+										//Thanks Hex-Rays Team for proposed fix.
+										if(!copy_named_type(get_idati(), til, typeName))
+											Log(llDebug, "copy_named_type('%s') error\n", typeName);
+
+#endif
+#endif //IDA_SDK_VERSION < 850
+									}
+									Log(llDebug, "found enum '%s' in til '%s', serial:%d val:0x%" FMT_64 "X mask:0x%" FMT_64 "X name:'%s'\n", typeName, til ? til->name : "local", *serial, memb.value, mask,  memb.name.c_str());
+									return typeName;
+								}
+								Log(llWarning, "not named enum ord:%u for \"%s\" 0x%" FMT_64 "X\n", ordinal, name, val);
+								return NULL;
+							}
+							(*serial)++;
 						}
 					}
 				}
@@ -312,16 +396,16 @@ static const char* importEnumFromTil(til_t *til, const char* name, uint64 val)
 	return NULL;
 }
 
-static const char* importEnumFromTils(const char* name, uint64 val)
+static const char* importEnumFromTils(const char* name, litval_t val, uchar *serial)
 {
 	Log(llDebug, "find enum memb %s (0x%x) in tils\n", name, val);
 	til_t *til = (til_t *)get_idati();
-	const char* typeName = importEnumFromTil(til, name, val);
+	const char* typeName = importEnumFromTil(til, name, val, serial);
 	if(typeName)
 		return typeName;
 
 	for (int i = 0; i < til->nbases; i++) {
-			const char* typeName = importEnumFromTil(til->base[i], name, val);
+			const char* typeName = importEnumFromTil(til->base[i], name, val, serial);
 			if (typeName)
 				return typeName;
 	}
@@ -332,12 +416,13 @@ static const char* importEnumFromTils(const char* name, uint64 val)
 	return NULL;
 }
 
-cexpr_t* lit_visitor_t::makeEnumExpr(const char* name, uint64 val, cexpr_t *constexp)
+cexpr_t* lit_visitor_t::makeEnumExpr(const char* name, litval_t val, cexpr_t *constexp)
 {
 #if IDA_SDK_VERSION < 850
 	const_t memb = get_enum_member_by_name(name);
 	if(memb == BADNODE) {
-		if(!importEnumFromTils(name, val)) 
+		uchar ser = 0;
+		if(!importEnumFromTils(name, val, &ser))
 			return NULL;
 		memb = get_enum_member_by_name(name);
 		if(memb == BADNODE)
@@ -353,10 +438,10 @@ cexpr_t* lit_visitor_t::makeEnumExpr(const char* name, uint64 val, cexpr_t *cons
 	auto serial = get_enum_member_serial(memb);
 #else //IDA_SDK_VERSION >= 850
 	//FIXME: I've not found fast way to get enum type-name from member-name, maybe need to implement some cashing?
-	const char* typeName = importEnumFromTils(name, val);
+	uchar serial = 0; // it seems this is serial num of member with the same value but different name
+	const char* typeName = importEnumFromTils(name, val, &serial);
 	if(!typeName)
 		return NULL;
-	uchar serial = 0; //FIXME: does it matter???
 	qstring enName = typeName;
 #endif //IDA_SDK_VERSION < 850
 
@@ -369,14 +454,14 @@ cexpr_t* lit_visitor_t::makeEnumExpr(const char* name, uint64 val, cexpr_t *cons
 	newexp->n->nf.type_name = enName;
 #if IDA_SDK_VERSION >= 750
 	newexp->n->nf.props |= NF_VALID; // no any other way to set enum, but ida 7.5 raise INTERR 52381 w/o NF_VALID flag
-	newexp->type = create_typedef(enName.c_str()); // ida 7.5 raise INTERR 52378 w/o this
 #endif // IDA_SDK_VERSION >= 750
+	newexp->type = create_typedef(enName.c_str()); // ida 7.5 raise INTERR 52378 w/o this
 	return newexp;
 }
 
 cexpr_t* lit_visitor_t::getLiteralExp(cexpr_t *constexp, const literals_t& l, bool exclusive)
 {
-	uint64 n = constexp->n->_value;
+	litval_t n = constexp->numval();
 	cexpr_t* exp = NULL;
 	auto i = l.find(n);
 	if (i != l.end()) {
@@ -400,7 +485,7 @@ cexpr_t* lit_visitor_t::getLiteralExp(cexpr_t *constexp, const literals_t& l, bo
 	if(exp) {
 		if(n) {
 			cexpr_t* newexp = new cexpr_t();
-			newexp->put_number(func, n, 4);
+			newexp->put_number(func, n, constexp->n->nf.org_nbytes);
 			exp = new cexpr_t(cot_bor, exp, newexp);
 		}
 		exp->calc_type(true);
@@ -420,12 +505,14 @@ bool lit_visitor_t::chkCallArg(cexpr_t *expr, qstring &comment)
 	qstring funcname;
 	if(!getExpName(func, expr->x, &funcname))
 		return false;
-	if(funcname.length() < 2)
-		return false;
+	stripName(&funcname, true);
+	qstring dname;
+	if(demangle_name(&dname, funcname.c_str(), MNG_NODEFINIT) >= 0)
+		funcname = dname;
 	lit_func_t lfunc = lit->find_func(funcname.c_str());
 	if(!lit->is_func(lfunc)) {
 		char lastChar = funcname.last();
-		if(lastChar != 'A' && lastChar != 'W') 
+		if(lastChar != 'A' && lastChar != 'W')
 			return false;
 		funcname.remove_last();
 		lfunc = lit->find_func(funcname.c_str());
@@ -439,8 +526,7 @@ bool lit_visitor_t::chkCallArg(cexpr_t *expr, qstring &comment)
 		if(arg->op == cot_num && !arg->n->nf.is_enum() && !(arg->n->nf.flags & NF_FIXED)) {
 			const lit_arg_t* larg = lit->find_arg(lfunc, (uint32)i + 1);
 			if (larg) {
-				uint64 val = arg->n->_value; // numval()
-				qstring s = getLiteralString(val, larg->refs, larg->exclusive);
+				qstring s = getLiteralString(arg->numval(), larg->refs, larg->exclusive);
 				appendComment(comment, s);
 				cexpr_t* newExp = getLiteralExp(arg, larg->refs, larg->exclusive);
 				if (newExp) {
@@ -469,7 +555,7 @@ bool lit_visitor_t::chkStrucMemb(cexpr_t *memb, cexpr_t *cons, qstring &comment)
 		return false;
 
 	// remove first underlining from struct typename
-	if (typeName[0] == '_') 
+	if (typeName[0] == '_')
 		typeName.remove(0, 1);
 
 	lit_struct_t ls = lit->find_struct(typeName.c_str());
@@ -479,7 +565,7 @@ bool lit_visitor_t::chkStrucMemb(cexpr_t *memb, cexpr_t *cons, qstring &comment)
 			return false;
 		typeName.remove_last();
 		ls = lit->find_struct(typeName.c_str());
-		if (!lit->is_struct(ls)) 
+		if (!lit->is_struct(ls))
 			return false;
 	}
 
@@ -492,8 +578,7 @@ bool lit_visitor_t::chkStrucMemb(cexpr_t *memb, cexpr_t *cons, qstring &comment)
 	if (!f)
 		return false;
 
-	uint64 val = cons->n->_value; // numval()
-	qstring s = getLiteralString(val, f->refs, f->exclusive);
+	qstring s = getLiteralString(cons->numval(), f->refs, f->exclusive);
 	appendComment(comment, s);
 	cexpr_t *newExp = getLiteralExp(cons, f->refs, f->exclusive);
 	if(newExp) {
@@ -503,14 +588,8 @@ bool lit_visitor_t::chkStrucMemb(cexpr_t *memb, cexpr_t *cons, qstring &comment)
 	return false;
 }
 
-bool lit_visitor_t::chkConstType(cexpr_t *expr, cexpr_t *cons, qstring &comment)
+bool lit_visitor_t::chkConstType(tinfo_t& type, cexpr_t *cons, qstring &comment)
 {
-	tinfo_t type;
-	if (expr->op == cot_cast)
-		type = expr->type;
-	else
-		type = expr->theother(cons)->type;
-
 	qstring typeName;
 	if (!type.get_type_name(&typeName)) {
 		//type.print(&typeName); // for debugging only
@@ -522,7 +601,7 @@ bool lit_visitor_t::chkConstType(cexpr_t *expr, cexpr_t *cons, qstring &comment)
 
 	const literals_t* l = NULL;
 	bool exclusive;
-	if (typeName == WINERROR) {
+	if (typeName == sWINERROR) {
 		lit_func_t flit = lit->find_func("RtlGetLastWin32Error");
 		if (!lit->is_func(flit))
 			return false;
@@ -531,37 +610,37 @@ bool lit_visitor_t::chkConstType(cexpr_t *expr, cexpr_t *cons, qstring &comment)
 			return false;
 		l = &la->refs;
 		exclusive = la->exclusive;
-	}
-#if IDA_SDK_VERSION < 750  //ida 7.5 raise INTERR 52378 (type name conflict? "HANDLE" & "MACRO_INVALID_HANDLE")
-	else if (typeName == "HANDLE") {
-		uint64 val = cons->n->_value; // numval()
+	} else if (typeName == "NTSTATUS") {
+		lit_func_t flit = lit->find_func("ZwClose");
+		if (!lit->is_func(flit))
+			return false;
+		const lit_arg_t *la = lit->find_arg(flit, 0);
+		if (!la)
+			return false;
+		l = &la->refs;
+		exclusive = la->exclusive;
+	} else if (typeName == "HANDLE") {
+		litval_t val = cons->numval();
 		const char* name;
 		switch (val) {
-		case (uint64)-1:  name = "INVALID_HANDLE_VALUE";  break;
-		case (uint64)-10: name = "STD_INPUT_HANDLE";      break;
-		case (uint64)-11: name = "STD_OUTPUT_HANDLE";     break;
-		case (uint64)-12: name = "STD_ERROR_HANDLE";      break;
+		case (litval_t)-1:  name = "INVALID_HANDLE_VALUE";  break;
+		case (litval_t)-10: name = "STD_INPUT_HANDLE";      break;
+		case (litval_t)-11: name = "STD_OUTPUT_HANDLE";     break;
+		case (litval_t)-12: name = "STD_ERROR_HANDLE";      break;
 		default:
 			return false;
 		}
 		cexpr_t *newExp = makeEnumExpr(name, val, cons);
-			//IDA bug: prints INVALID_FILE_SIZE instead INVALID_HANDLE_VALUE
 		if (newExp) {
-			newExp->type = expr->type;
-			replaceExp(func, expr, newExp);
+			replaceExp(func, cons, newExp);
 			return true;
-		}		
-		return false;
-	}	else {
-		//TODO: add more typenames here
+		}
 		return false;
 	}
-#endif // IDA_SDK_VERSION < 750
 	if (!l)
 		return false;
 
-	uint64 val = cons->n->_value; // numval()
-	qstring s = getLiteralString(val, *l, exclusive);
+	qstring s = getLiteralString(cons->numval(), *l, exclusive);
 	appendComment(comment, s);
 	cexpr_t *newExp = getLiteralExp(cons, *l, exclusive);
 	if (newExp) {
@@ -576,21 +655,31 @@ int idaapi lit_visitor_t::visit_expr(cexpr_t *expr)
 	qstring comment;
 	bool changed = false;
 	if(expr->op == cot_call) {
-		changed |= chkCallArg(expr, comment);
-	} else if((expr->op >= cot_asg && expr->op <= cot_ult)) {
+		changed = chkCallArg(expr, comment);
+	} else if((expr->op == cot_asg || is_relational(expr->op))) {
 		cexpr_t *cons = expr->find_op(cot_num);
-		if(cons) {
-			cexpr_t *memb = expr->theother(cons);
-			if(memb->op == cot_memref || memb->op == cot_memptr)
-				changed |= chkStrucMemb(memb, cons, comment);
-			else 
-				changed |= chkConstType(expr, cons, comment);
+		if(cons && !cons->n->nf.is_fixed()) {
+			cexpr_t *other = expr->theother(cons);
+			if(other->op == cot_memref || other->op == cot_memptr)
+				changed = chkStrucMemb(other, cons, comment);
+			if(!changed)
+				changed = chkConstType(other->type, cons, comment);
 		}
-	}	else if (expr->op == cot_cast && expr->x->op == cot_num) {
-		changed |= chkConstType(expr, expr->x, comment);
+	}	else if (expr->op == cot_cast && expr->x->op == cot_num && !expr->x->n->nf.is_fixed()) {
+		changed = chkConstType(expr->type, expr->x, comment);
 	}
 
 	cmtModified |= setComment4Exp(func, cmts, expr, comment.c_str(), changed);
+	return 0;
+}
+
+int idaapi lit_visitor_t::visit_insn(cinsn_t *insn)
+{
+	if(insn->op == cit_return && insn->creturn->expr.op == cot_num && !insn->creturn->expr.n->nf.is_fixed() && !return_type.empty()) {
+		qstring comment;
+		bool changed = chkConstType(return_type, &insn->creturn->expr, comment);
+		cmtModified |= setComment4Exp(func, cmts, &insn->creturn->expr, comment.c_str(), changed);
+	}
 	return 0;
 }
 
@@ -611,7 +700,7 @@ bool lit_overrideTypes()
 	if (!lit)
 		return true;
 
-	if (get_named_type(NULL, WINERROR, NTF_TYPE | NTF_NOBASE))
+	if (get_named_type(NULL, sWINERROR, NTF_TYPE | NTF_NOBASE))
 		return true;
 
 	uint32 ord = alloc_type_ordinal(NULL);
@@ -620,12 +709,12 @@ bool lit_overrideTypes()
 
 	tinfo_t t;
 	t.create_simple_type(BT_INT32);
-	t.set_named_type(NULL, WINERROR, 0);
+	t.set_named_type(NULL, sWINERROR, 0);
 
 	const char* const funcnames[] = {"GetLastError", "__imp_GetLastError", "RtlGetLastWin32Error", "RegOpenKey"};
 	for(size_t i = 0, n = qnumber(funcnames); i < n; i++) {
 		ea_t ea = get_name_ea(BADADDR, funcnames[i]);
-		if (ea == BADADDR /*|| is_func(get_flags(ea))*/)
+		if (ea == BADADDR)
 			continue;
 		tinfo_t ft;
 		get_tinfo(&ft, ea);
@@ -652,7 +741,7 @@ bool lit_overrideTypes()
 void lit_init()
 {
 	char litfname[QMAXPATH];
-	if(getsysfile(litfname, QMAXPATH, "literal.txt", PLG_SUBDIR)) {
+	if(getPluginsFile(litfname, QMAXPATH, "literal.txt")) {
 		linput_t *litfile = open_linput(litfname, false);
 		if (litfile) {
 			lit = new literal_db();

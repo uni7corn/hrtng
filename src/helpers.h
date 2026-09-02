@@ -34,6 +34,11 @@
 #define ACT_NAME(name) "hrt:" # name
 #define ACT_DESC(label, shortcut, name) ACTION_DESC_LITERAL(ACT_NAME(name), label, &name, shortcut, NULL, -1)
 #define ACT_DESC1(label, shortcut, name) static const action_desc_t action_ ## name = ACT_DESC(label, shortcut, name);
+#if IDA_SDK_VERSION < 800
+#define ACT_DESC_CHECK(label, shortcut, name) ACT_DESC(label, shortcut, name)
+#else //  IDA_SDK_VERSION >= 800
+#define ACT_DESC_CHECK(label, shortcut, name) ACTION_DESC_LITERAL_OWNER(ACT_NAME(name), label, &name, &PLUGIN, shortcut, NULL, -1, ADF_OT_PLUGIN | ADF_CHECKABLE | ADF_CHECKED)
+#endif // IDA_SDK_VERSION < 800
 #define ACT_DEF(name) int idaapi name ## _t::activate(action_activation_ctx_t *ctx)
 #define ACT_REG(name) register_action(action_ ## name)
 #define ACT_UNREG(name) unregister_action(ACT_NAME(name))
@@ -45,6 +50,34 @@
 	};\
 	static name ## _t name;
 
+#if IDA_SDK_VERSION < 940
+	inline ssize_t get_func_cmt_ea(qstring * buf, ea_t ea, bool repeatable) { func_t* f = get_func(ea); return f ? get_func_cmt(buf, f, repeatable) : 0; }
+	inline ea_t get_func_start(ea_t ea) { func_t* f = get_func(ea); return f ? f->start_ea : BADADDR; }
+	inline ea_t get_func_ea_by_num(size_t n) { func_t* f = getn_func(n); return f ? f->start_ea : BADADDR; }
+	inline asize_t calc_func_size_ea(ea_t ea) { func_t* f = get_func(ea); return f ? calc_func_size(f) : 0; }
+	inline uint64 get_func_flags(ea_t ea) { func_t* f = get_func(ea); return f ? f->flags : 0; }
+	inline ea_t choose_func_ea(const char* title, ea_t default_ea) { { func_t* f = choose_func(title, default_ea); return f ? f->start_ea : BADADDR; } }
+	inline bool remove_func_tail_ea(ea_t func_ea, ea_t tail_ea) { func_t* f = get_func(func_ea); return f ? remove_func_tail(f, tail_ea) : false; }
+	inline bool append_func_tail_ea(ea_t func_ea, ea_t ea1, ea_t ea2) { func_t* f = get_func(func_ea); return f ? append_func_tail(f, ea1, ea2) : false; }
+	inline void reanalyze_function_ea(ea_t func_ea, ea_t ea1 = 0, ea_t ea2 = BADADDR, bool analyze_parents = false) {	func_t* f = get_func(func_ea); if (f) reanalyze_function_ea(func_ea, ea1, ea2, analyze_parents);}
+	inline func_t* get_func_94(ea_t ea) { return get_func(ea); }
+	inline cfuncptr_t decompile_func_94(ea_t ea, hexrays_failure_t* hf, int decomp_flags) { func_t* f = get_func(ea); return f ? decompile_func(f, hf, decomp_flags) : cfuncptr_t(nullptr); }
+	#define decomp_ranges_t mba_ranges_t
+	#define decompile_function decompile_func
+#else
+	#define get_func_94(ea) ea
+	#define decompile_func_94(ea, hf, decomp_flags) decompile_function(ea, hf, decomp_flags)
+#endif
+
+#if IDA_SDK_VERSION < 930
+  #define BWN_TITREE BWN_TICSR
+  #define mark_builtin_widgets request_refresh
+#else
+  #define CHCOL_INODENAME OBSOLETE_CHCOL_INODENAME
+  #define CH_HAS_DIRTREE OBSOLETE_CH_HAS_DIRTREE
+  #define CH_TM_FULL_TREE OBSOLETE_CH_TM_FULL_TREE
+  #define CH_NON_PERSISTED_TREE OBSOLETE_CH_NON_PERSISTED_TREE
+#endif
 
 #if IDA_SDK_VERSION < 920
   #define MY_DECLARE_LISTENER(name) static ssize_t idaapi name(void *ud, int ncode, va_list va)
@@ -88,11 +121,18 @@
 
 #if IDA_SDK_VERSION < 830
 	#define flags64_t flags_t
+  #define DSTR(x) ""
+  #define DECOMP_GXREFS_FORCE 0
+#else
+  #define DSTR(x) (x)->dstr()
 #endif // IDA_SDK_VERSION < 830
 
 #if IDA_SDK_VERSION < 760
 	inline ssize_t idaapi get_ida_notepad_text(qstring *buf) { return root_node.supstr(buf, RIDX_NOTEPAD); }
 	inline void idaapi set_ida_notepad_text(const char *text, size_t size=0) { root_node.supset(RIDX_NOTEPAD, text); }
+	inline void chain_append_list(const chain_t& ch, const mbl_array_t* mba, mlist_t *list) { ch.append_list(list); }
+#else
+	inline void chain_append_list(const chain_t& ch, const mbl_array_t* mba, mlist_t *list) { ch.append_list(mba, list); }
 #endif //IDA_SDK_VERSION < 760
 
 #if IDA_SDK_VERSION < 750
@@ -163,7 +203,7 @@ qstring good_udm_name(const tinfo_t &struc, uint64 offInBits, const char *format
 qstring good_smember_name(const struc_t* sptr, ea_t offset, const char *format, ...);
 #endif
 void mk_name_w(qstring& name);
-bool get_class_name(const char* fullName, qstring *classname);
+bool ctor_class_name(const char* fullName, qstring *classname);
 
 qstring gen_disasm(ea_t ea, asize_t len);
 void add_patch_cmt(ea_t ea, asize_t patchLen);
@@ -181,11 +221,12 @@ bool jump_custom_viewer(TWidget *custom_viewer, int line, int x, int y);
 bool isWnd();
 bool appendComment(qstring &comments, qstring &newCmt, bool bDuplicable = false);
 bool setComment4Exp(cfunc_t* func, user_cmts_t *cmts, citem_t *expr, const char* comment, bool bDisasmOnly = false, bool bSemicolonCmt = false, bool bOverride = false);
-tinfo_t getCallInfo(cexpr_t *call, ea_t* dstea);
+ea_t get_name_ea_ex(qstring &name);
+ea_t get_call_dst(cfunc_t* cfunc, cexpr_t *call);
+tinfo_t getCallInfo(cfunc_t* cfunc, cexpr_t *call, ea_t* dstea);
 void replace_colortag_inplace(char *line, int pos, char prefix, char find, char replace);
 void replaceExp(const cfunc_t *func, cexpr_t *expr, cexpr_t *newExp, bool clean = true);
 qstring printExp(const cfunc_t *func, cexpr_t *expr);
-void printExp2Msg(const cfunc_t *func, cexpr_t *expr, const char* mesg);
 void dump_ctree(cfunc_t* func, const char* fname);
 inline THREAD_SAFE bool isRegOvar(mopt_t mop) { return mop == mop_r || mop == mop_S /*|| mop == mop_l*/; }
 inline THREAD_SAFE cexpr_t* skipCast(cexpr_t* e) {if(e->op == cot_cast) return e->x; return e;}
@@ -226,17 +267,18 @@ struct qstr_printer_t : public vd_printer_t
 enum LogLevel {
 	llError,
 	llWarning,
-	llNotice,
-	llInfo,
+	llNotice, // important messages and stat
+	llInfo,   // changes made by the plugin
 	llDebug,
-	llFlood
+	llFlood  // deep debug meditation
 };
 void LogLevelNames(qstrvec_t *v);
 int Log(LogLevel level, const char *fmt, ...);
 int LogTail(LogLevel level, const char *fmt, ...);
+int LogExpr(LogLevel level, const cfunc_t *func, cexpr_t *expr, const char* mesg);
 
 template< class IsUniqueFunc >
-qstring unique_name(const char* name, const char* separator, IsUniqueFunc isUnique)
+qstring unique_nameD(const char* name, const char* separator, IsUniqueFunc isUnique)
 {
 	qstring uName = name;
 	for(int i = 1; i < 1000; i++) {
@@ -245,7 +287,30 @@ qstring unique_name(const char* name, const char* separator, IsUniqueFunc isUniq
 		uName = name;
 		uName.cat_sprnt("%s%d", separator, i);
 	}
-	Log(llError, "FIXME! unique_name '%s' is not unique\n", uName.c_str());
+	Log(llError, "FIXME! unique_nameD '%s' is not unique\n", uName.c_str());
 	return uName;
 }
 
+template< class IsUniqueFunc >
+qstring unique_nameC(const char* name, const char* separator, IsUniqueFunc isUnique)
+{
+	qstring uName = name;
+	const char *sepr = separator;
+	for (char j = 'z'; j > 'f'; j--) {
+		qstring basename = uName;
+		for (char i = 'z'; i > 'f'; i--) {
+			if(isUnique(uName))
+				return uName;
+			uName = basename;
+			uName.cat_sprnt("%s%c", sepr, i);
+		}
+		uName = name;
+		uName.cat_sprnt("%s%c", separator, j);
+		sepr = "";
+	}
+	Log(llError, "FIXME! unique_nameC '%s' is not unique\n", uName.c_str());
+	return uName;
+}
+
+char* getPluginsFile(char *buf, size_t bufsize, const char *filename);
+bool isFuncOrFuncptr(ea_t ea);

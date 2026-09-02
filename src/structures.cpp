@@ -55,15 +55,13 @@ void add_structures_popup_items(TWidget *view, TPopupMenu *p)
 int extract_substruct(uval_t idx, uval_t begin, uval_t end)
 {
 	tid_t id = get_struc_by_idx( idx );
-	if (is_union(id))
-		return 0;
-	struc_t * struc = get_struc(id);
-	if(!struc)
+	struc_t *struc = get_struc(id);
+	if(!struc || struc->is_union())
 		return 0;
 
 	qstring struc_name;
 	get_struc_name(&struc_name, id);
-	struc_name = unique_name(struc_name.c_str(), "_obj", [](const qstring& n) { return get_name_ea(BADADDR, n.c_str()) == BADADDR; });
+	struc_name = unique_nameD(struc_name.c_str(), "_obj", [](const qstring& n) { return get_name_ea(BADADDR, n.c_str()) == BADADDR; });
 
 	tid_t newid = add_struc(idx+1, struc_name.c_str());
 	struc_t * newstruc = get_struc(newid);
@@ -366,11 +364,8 @@ bool compare_structs(struc_t * str1, asize_t begin, struc_t * str2)
 int which_struct_matches_here(uval_t idx1, uval_t begin, uval_t end)
 {
 	tid_t id = get_struc_by_idx(idx1);
-	if (is_union(id))
-		return 0;
-
-	struc_t * struc = get_struc(id);
-	if(!struc)
+	struc_t *struc = get_struc(id);
+	if(!struc || struc->is_union())
 		return 0;
 
 	uval_t last = get_struc_prev_offset(struc, end);
@@ -381,10 +376,8 @@ int which_struct_matches_here(uval_t idx1, uval_t begin, uval_t end)
 	matched_structs_t m;
 	for(uval_t idx = get_first_struc_idx(); idx!=BADNODE; idx=get_next_struc_idx(idx)) {
 		tid_t id = get_struc_by_idx(idx);
-		struc_t * struc_candidate = get_struc(id);
-		if(!struc_candidate)
-			continue;
-		if(is_union(id))
+		struc_t *struc_candidate = get_struc(id);
+		if(!struc_candidate || struc_candidate->is_union())
 			continue;
 		if(get_struc_size(struc_candidate) != size)
 			continue;
@@ -399,23 +392,16 @@ int which_struct_matches_here(uval_t idx1, uval_t begin, uval_t end)
 
 int unpack_this_member(uval_t idx, uval_t offset)
 {
-	tid_t id = get_struc_by_idx( idx );
-	if(is_union(id))
-		return 0;
-
-	struc_t * struc = get_struc(id);
-	if(!struc)
+	struc_t *struc = get_struc(get_struc_by_idx(idx));
+	if(!struc || struc->is_union())
 		return 0;
 
 	member_t * member = get_member( struc, offset);
 	if (!member || member->get_soff() != offset)
 		return 0;
 
-	struc_t * membstr = get_sptr(member);
-	if(!membstr)
-		return 0;
-
-	if (is_union(membstr->id))
+	struc_t *membstr = get_sptr(member);
+	if(!membstr || membstr->is_union())
 		return 0;
 
 	asize_t delta = offset;
@@ -498,7 +484,7 @@ ACT_DEF(create_VT_callback)
 #endif // IDA_SDK_VERSION < 850
 
 #if IDA_SDK_VERSION < 850
-void add_vt_member(struc_t* sptr, ea_t offset, const char* name, const tinfo_t& type, ea_t ref)
+void add_vt_member(struc_t* sptr, ea_t offset, const char* name, const tinfo_t& type, ea_t ref, bool mayDestroy = false)
 {
 	flags64_t flag;
 	asize_t nbytes;
@@ -511,20 +497,23 @@ void add_vt_member(struc_t* sptr, ea_t offset, const char* name, const tinfo_t& 
 	}
 	add_struc_member(sptr, NULL, offset, flag, NULL, nbytes); //ifnore error, member may exists
 
-	set_member_name(sptr, offset, good_smember_name(sptr, offset, name).c_str());
 	member_t* memb = get_member(sptr, offset);
-	set_member_tinfo(sptr, memb, 0, type, SET_MEMTI_COMPATIBLE);
+	set_member_tinfo(sptr, memb, 0, type, mayDestroy ? SET_MEMTI_MAY_DESTROY : SET_MEMTI_COMPATIBLE);
+	set_member_name(sptr, offset, good_smember_name(sptr, offset, name).c_str());
 	add_proc2memb_ref(ref, memb->id);
 }
 
 #else //IDA_SDK_VERSION >= 850
 
-void add_vt_member(tinfo_t &struc, ea_t offset, const char* name, const tinfo_t &type, ea_t ref)
+void add_vt_member(tinfo_t &struc, ea_t offset, const char* name, const tinfo_t &type, ea_t ref, bool mayDestroy = false)
 {
 	udm_t udm;
 	udm.offset = offset * 8;
-	udm.size = (is64bit() && !isIlp32()) ? 8 * 8 : 4 * 8;
 	udm.type = type;
+	if (type.is_struct())
+		udm.size = type.get_size();
+	else
+		udm.size = (is64bit() && !isIlp32()) ? 8 * 8 : 4 * 8;
 	udm.name = good_udm_name(struc, udm.offset, name);
 	tinfo_code_t err = struc.add_udm(udm, ETF_AUTONAME);
 	int index = struc.find_udm(udm.offset);
@@ -532,15 +521,13 @@ void add_vt_member(tinfo_t &struc, ea_t offset, const char* name, const tinfo_t 
 		return;
 	if (err != TERR_OK) {
 		// probably already exist
+		struc.set_udm_type(index, udm.type, mayDestroy ? ETF_MAY_DESTROY : 0);
 		struc.rename_udm(index, udm.name.c_str());
-		struc.set_udm_type(index, udm.type);
 	}
 	tid_t tid = struc.get_udm_tid(index);
 	if(tid != BADADDR)
 		add_proc2memb_ref(ref, tid);
 }
-// member offset to func addr mapping to temporary store xrefs instead of add_proc2memb_ref cant be created for detached udt
-typedef std::map<ea_t, ea_t, std::less<ea_t> > refmap_t;
 #endif //IDA_SDK_VERSION < 850
 
 tinfo_t type_by_tid(tid_t tid)
@@ -555,7 +542,7 @@ tinfo_t type_by_tid(tid_t tid)
 	return type;
 }
 
-bool compare_struct(const tinfo_t& left, const tinfo_t& right)
+bool compare_struct(const tinfo_t& left, const tinfo_t& right, bool ignoreName)
 {
 	udt_type_data_t l, r;
 	if(!left.get_udt_details(&l) || !right.get_udt_details(&r))
@@ -578,15 +565,15 @@ bool compare_struct(const tinfo_t& left, const tinfo_t& right)
 			 lm.effalign != rm.effalign ||
 			 lm.tafld_bits != rm.tafld_bits ||
 			 lm.fda != rm.fda ||
-			 lm.name != rm.name ||
-			 //lm.cmt != rm.cmt ||
-			 lm.type != rm.type)
+			 lm.type != rm.type ||
+			 (!ignoreName && lm.name != rm.name)
+			 )
 			return false;
 	}
 	return true;
 }
 
-tid_t create_VT_struc(ea_t VT_ea, const char * basename, uval_t idx /*= BADADDR*/, unsigned int * vt_len /*= NULL*/, bool autoScan /*= false*/)
+tid_t create_VT_struc(ea_t VT_ea, const char * basename, uval_t idx /*= BADADDR*/, unsigned int * vt_len /*= NULL*/, bool autoScan /*= false*/, bool* alreadyExist /*= nullptr*/)
 {
 	qstring name_vt(basename);
 	if (!basename) {
@@ -622,7 +609,7 @@ tid_t create_VT_struc(ea_t VT_ea, const char * basename, uval_t idx /*= BADADDR*
 	struccmt.sprnt("@0x%a", VT_ea);
 
 	name_vt.rtrim('_'); // avoid names ending like "_12" to not exec name-to-type conversion
-	name_vt = unique_name(name_vt.c_str(), "", [](const qstring& n) { return !isNamedTypeExists(n.c_str()); });
+	name_vt = unique_nameD(name_vt.c_str(), "", [](const qstring& n) { return !isNamedTypeExists(n.c_str()); });
 
 	tid_t newid = BADADDR;
 #if IDA_SDK_VERSION < 850
@@ -648,7 +635,7 @@ tid_t create_VT_struc(ea_t VT_ea, const char * basename, uval_t idx /*= BADADDR*
 		return BADADDR;
 	}
 	tinfo_t &newType = newstruc;
-	refmap_t refmap;
+	std::map<ea_t, ea_t, std::less<ea_t> > refmap; // member offset to func addr mapping to temporary store xrefs instead of add_proc2memb_ref cant be created for detached udt
 #endif //IDA_SDK_VERSION >= 850
 
 	ea_t ea = VT_ea;
@@ -717,13 +704,15 @@ tid_t create_VT_struc(ea_t VT_ea, const char * basename, uval_t idx /*= BADADDR*
 		// compare new struc with existing one to avoid duplicates
 		tinfo_t oldType;
 		if(get_tinfo(&oldType, VT_ea) && oldType.is_struct()) {
-			if(compare_struct(oldType, newType)) { //if(oldType.compare_with(newType, TCMP_EQUAL)) { // always returns false
+			if(compare_struct(oldType, newType, autoScan)) { //if(oldType.compare_with(newType, TCMP_EQUAL)) { // always returns false
 				ok = false;
 				newid = BADADDR;
 				qstring oldTname;
 				if(oldType.get_type_name(&oldTname)) {
 					newid = get_named_type_tid(oldTname.c_str());
 					Log(llDebug, "%a: new VTBL struc type is equal to existing '%s'\n", VT_ea, oldTname.c_str());
+					if (alreadyExist)
+						*alreadyExist = true;
 				}
 			} else {
 				Log(llInfo, "%a create_VT_struc: existing type '%s' is not equal to current state '%s', updating\n", VT_ea, oldType.dstr(), newType.dstr());
@@ -830,25 +819,53 @@ int create_VT(tid_t parent, ea_t VT_ea, bool autoScan/*= false*/, const char *to
 			if(autoScan) {
 				// disable update/duplicate VTBL creation in autoScan mode
 				for(auto vtea: eav)
-					if(vtea == VT_ea)
+					if(vtea == VT_ea) {
+						Log(llDebug, "create_VT: existing VT at %a\n", VT_ea);
 						return 0;
+					}
 			}
 		}
 	}
 
 	// use topmost struct name on adding vtables of derived classes
 	// left name_VT as base class union name
-	if(topStructName && *topStructName && eav.size() > 0) {
+	if(topStructName && *topStructName && eav.size() > 0)
 		name = topStructName;
-	}
 
-	tid_t vt_struc_id = create_VT_struc(VT_ea, name.c_str(), vtstruc_idx, NULL, autoScan);
+	bool alreadyExist = false;
+	tid_t vt_struc_id = create_VT_struc(VT_ea, name.c_str(), vtstruc_idx, NULL, autoScan, &alreadyExist);
 	if(vt_struc_id == BADADDR)
 		return 0;
 
 	switch (eav.size()) {
 	case 0:
-		// first VTBL adding, do nothing and fall down
+		// first VTBL adding, check is it base class vtbl
+		if (autoScan && alreadyExist) {
+			tinfo_t vtType = type_by_tid(vt_struc_id);
+			qstring baseClassName;
+			if (vtType.get_type_name(&baseClassName)) {
+				baseClassName.remove(baseClassName.find(VTBL_SUFFIX), qstrlen(VTBL_SUFFIX));
+				if(name != baseClassName) {
+					tinfo_t baseClassType;
+#if IDA_SDK_VERSION < 850
+					if(isNamedTypeExists(baseClassName.c_str())) {
+						baseClassType = create_typedef(baseClassName.c_str());
+						size_t structSize = get_struc_size(struc);
+#else //IDA_SDK_VERSION >= 850
+					if(baseClassType.get_named_type(baseClassName.c_str())) {
+						size_t structSize = struc.get_size();
+#endif //IDA_SDK_VERSION < 850
+						if(baseClassType.is_struct() && baseClassType.get_size() <= structSize) {
+							Log(llInfo, "%a: set class `%s` is derived from '%s'\n", VT_ea, name.c_str(), baseClassName.c_str());
+							baseClassName.append('_');
+							add_vt_member(struc, 0, baseClassName.c_str(), baseClassType, VT_ea, true);
+							return 1;
+						}
+					}
+				}
+			}
+		}
+		// fall down to add_vt_member
 		break;
 	case 1:
 		if (VT_ea == eav.front()) {
@@ -883,7 +900,7 @@ int create_VT(tid_t parent, ea_t VT_ea, bool autoScan/*= false*/, const char *to
 			enable_numbered_types(nullptr, true);// is it need???
 			uint32 ord = alloc_type_ordinal(nullptr);
 			qstring utname("u"); utname.append(name_VT);
-			utname = unique_name(utname.c_str(), "", [](const qstring& n) { return !isNamedTypeExists(n.c_str()); });
+			utname = unique_nameD(utname.c_str(), "", [](const qstring& n) { return !isNamedTypeExists(n.c_str()); });
 			tinfo_code_t err = utype.set_numbered_type(nullptr, ord, 0, utname.c_str());
 			if (err == TERR_OK) {
 #if IDA_SDK_VERSION < 850
@@ -897,6 +914,7 @@ int create_VT(tid_t parent, ea_t VT_ea, bool autoScan/*= false*/, const char *to
 				err = struc.set_udm_type(idx, make_pointer(utype));
 				if (err == TERR_OK) {
 #endif //IDA_SDK_VERSION < 850
+					Log(llInfo, "Added %u VTBL %s at %a in class %s\n", eav.size(), type_by_tid(vt_struc_id).dstr(), VT_ea, name.c_str());
 					add_proc2memb_ref(VT_ea, mtid);
 					return 1;
 				}
@@ -947,6 +965,7 @@ int create_VT(tid_t parent, ea_t VT_ea, bool autoScan/*= false*/, const char *to
 			err = vtblType.add_udm(udm, ETF_AUTONAME);
 			if (err == TERR_OK) {
 #endif //IDA_SDK_VERSION < 850
+				Log(llInfo, "Added %u VTBL %s at %a in class %s\n", eav.size(), type_by_tid(vt_struc_id).dstr(), VT_ea, name.c_str());
 				add_proc2memb_ref(VT_ea, mtid);
 				return 1;
 			}
@@ -958,6 +977,7 @@ int create_VT(tid_t parent, ea_t VT_ea, bool autoScan/*= false*/, const char *to
 	//create or update first VTBL
 	tinfo_t type = type_by_tid(vt_struc_id);
 	add_vt_member(struc, 0, VTBL_MEMNAME, make_pointer(type), VT_ea);
+	Log(llInfo, "Added %u VTBL %s at %a in class %s\n", eav.size(), type.dstr(), VT_ea, name.c_str());
 	return 1;
 }
 
@@ -1079,8 +1099,23 @@ void auto_vtbls(cfunc_t *cfunc)
 			udm_t m;
 			m.name = vtblName;
 			int midx = unionType.find_udm(&m, STRMEM_NAME);
-			if(midx < 0 || static_cast<decltype(vtbl->m)>(midx) == vtbl->m) {// not found or nothing to change
-				Log(llDebug, "%a selectVT: %s %s\n", call->ea, vtblName.c_str(), midx < 0 ? "not found" : "already selected");
+			if(midx < 0) {// not found. For the types imported from another idb, new vtbl structure with index in name has been created. Search it
+				m.name.remove_last();
+				for(int i = 1; i < 10; i++) { //ATT! currently max 9
+					m.name.cat_sprnt("%d_");
+					midx = unionType.find_udm(&m, STRMEM_NAME);
+					if(midx >= 0)
+						break;
+					m.name.remove_last(2); //ATT! currently max 9
+				}
+				if(midx < 0) {
+					Log(llDebug, "%a selectVT: %s not found\n", call->ea, vtblName.c_str());
+					return 0;
+				}
+			}
+
+			if(static_cast<decltype(vtbl->m)>(midx) == vtbl->m) {// nothing to change
+				Log(llDebug, "%a selectVT: %s already selected\n", call->ea, vtblName.c_str());
 				return 0;
 			}
 			// dynamically change (don't save selection) vtbl union member and type of expression
@@ -1120,7 +1155,7 @@ void auto_vtbls(cfunc_t *cfunc)
 				}
 			}
 
-			Log(llNotice, "%a: auto-selected VT: %s\n", call->ea, vtblName.c_str());
+			Log(llInfo, "%a: auto-selected VT: %s\n", call->ea, vtblName.c_str());
 			return 0; // recalc_parent_types does not help
 		}
 		int idaapi visit_expr(cexpr_t *e)
@@ -1142,17 +1177,19 @@ bool confirm_create_struct(tinfo_t &out_type, qstring& strucname, tinfo_t &in_ty
 {
 	if(strucname.empty())
 		strucname = dummy_struct_name(in_type.get_size(), sprefix);
+	tinfo_t new_type = in_type;
 	while(1) {
 		qstring tdecl;
-		if(!in_type.print(&tdecl, strucname.c_str(), PRTYPE_MULTI | PRTYPE_TYPE | PRTYPE_PRAGMA | PRTYPE_SEMI, 5, 40, NULL, NULL))
+		if(!new_type.print(&tdecl, strucname.c_str(), PRTYPE_MULTI | PRTYPE_TYPE | PRTYPE_PRAGMA | PRTYPE_SEMI, 5, 40, NULL, NULL))
 			return false;
 
 		if(!ask_text(&tdecl, 0, tdecl.c_str(), "[hrt] The following new type %s will be created", strucname.c_str()))
 			return false;
 
-		tinfo_t new_type;
-		if (!parse_decl(&new_type, &strucname, NULL, tdecl.c_str(), PT_TYP))
+		if (!parse_decl(&new_type, &strucname, NULL, tdecl.c_str(), PT_TYP)) {
+			new_type = in_type;
 			continue;
+		}
 
 		tinfo_code_t err = new_type.set_named_type(NULL, strucname.c_str(), NTF_TYPE);
 		if (TERR_OK != err) {
@@ -1233,7 +1270,7 @@ ea_t get_memb2proc_ref(tinfo_t& s, uint32 offInBytes)
 	} else {
 		qstring mname = get_member_name(m->id);
 		stripName(&mname);
-		dstEA = get_name_ea(BADADDR, mname.c_str());
+		dstEA = get_name_ea_ex(mname);
 	}
 #else
 	// actually get_vftable_ea is appeared in ida 7.6 but here will be used from ida9 because it probably depends on TAUDT_VFTABLE flag has been set in create_VT_struc
@@ -1253,7 +1290,7 @@ ea_t get_memb2proc_ref(tinfo_t& s, uint32 offInBytes)
 	if(dstEA == BADADDR) {
 		qstring mname = memb.name.c_str();
 		stripName(&mname);
-		dstEA = get_name_ea(BADADDR, mname.c_str());
+		dstEA = get_name_ea_ex(mname);
 	}
 	Log(llDebug, "get_memb2proc_ref: dstEA %a for %s.%s\n", dstEA, s.dstr(), memb.name.c_str());
 #endif //IDA_SDK_VERSION < 850

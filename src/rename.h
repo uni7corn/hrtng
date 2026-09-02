@@ -22,7 +22,9 @@ void autorename_n_pull_comments(cfunc_t *cfunc);
 bool getExpName(cfunc_t *func, cexpr_t* exp, qstring* name, bool derefPtr = false);
 bool getVarName(lvar_t * var, qstring* name);
 bool getUdtMembName(tinfo_t udt, uint32 offset, qstring* name);
+bool getEaName(ea_t ea, qstring* name);
 bool renameExp(ea_t refea, cfunc_t *func, cexpr_t* exp, qstring* name, vdui_t *vdui = NULL, bool derefPtr = false);
 bool renameVar(ea_t refea, cfunc_t *func, ssize_t varIdx, const qstring* name, vdui_t *vdui = NULL); //vdui->rename_lvar can rebuild all internal structures/ call later!!!
 bool renameEa(ea_t refea, ea_t ea, const qstring* name);
 bool isIdaInternalComment(const char* comment);
+tinfo_t getExpType(cfunc_t *func, cexpr_t* exp);

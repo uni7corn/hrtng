@@ -46,6 +46,16 @@ static const char* badVarNames[] = {
   "inited", "started", "result", "data", "Mem", "Memory", "Block", "String", "ProcName", "ProcAddress", "LibFileName", "ModuleName", "LibraryA", "LibraryW"
 };
 
+inline bool isHex(char x)
+{
+	return (x >= '0' && x <= '9') || (x >= 'A' && x <= 'F');
+}
+
+inline bool isHexa(char x)
+{
+	return isHex(x) || x == 'a';
+}
+
 //for Vars and Args only (globals and struct members have own checks)
 static bool isVarNameGood(const char* name)
 {
@@ -53,7 +63,7 @@ static bool isVarNameGood(const char* name)
 		return false;
 
 	// names like: arg10, a10, arg_10, a_10, a2a
-	//             var10, v10, var_10, v_10
+	//             var10, v10, var_10, v_10, var_1A0
 	// (with and without '_')
 	if ((name[0] == 'a' || name[0] == 'v')) {
 		const char* vname = name + 1;
@@ -62,11 +72,11 @@ static bool isVarNameGood(const char* name)
 			vname = name + 3;
 		if(*vname == '_')
 			vname++;
-		if(
-	  (vname[0] == 0 ||   (vname[0] >= '0' && vname[0] <= '9' &&
-		(vname[1] == 0 || (((vname[1] >= '0' && vname[1] <= '9') || vname[1] == 'a') && //smth like 'a22' or 'a2a'
-		(vname[2] == 0 ||   (vname[2] >= '0' && vname[2] <= '9' &&
-	   vname[3] == 0)))))))
+		if((vname[0] == 0 || (isHex(vname[0]) &&
+			 (vname[1] == 0 || (isHexa(vname[1]) && //smth like 'a22' or 'a2a'
+			 (vname[2] == 0 || (isHexa(vname[2]) &&
+			 (vname[3] == 0 || (isHexa(vname[3]) &&
+			 vname[4] == 0)))))))))
 		return false;
 	}
 
@@ -74,7 +84,7 @@ static bool isVarNameGood(const char* name)
 	//annoing p_fld_xx renaming with ida 7.6
 	if(name[0] == 'p' && name[1] == '_')
 		name += 2;
-	if(!strncmp(name, "fld_", 4))
+	if(!strncmp(name, "field_", 4))
 		return false;
 #endif // IDA_SDK_VERSION == 760
 
@@ -161,7 +171,7 @@ static bool getCallName(cfunc_t *func, cexpr_t* call, qstring* name)
 		return true;
 	}
 
-	if(get_class_name(funcname.c_str(), name))
+	if(ctor_class_name(funcname.c_str(), name))
 		return true;
 
 	carglist_t &args = *call->a;
@@ -201,7 +211,7 @@ static bool getCallName(cfunc_t *func, cexpr_t* call, qstring* name)
 	return false;
 }
 
-static bool getEaName(ea_t ea, qstring* name)
+bool getEaName(ea_t ea, qstring* name)
 {
 	flags64_t flg = get_flags(ea);
 	if(is_tail(flg) && isARM()) {
@@ -229,10 +239,12 @@ static bool getEaName(ea_t ea, qstring* name)
 	if (has_user_name(flg) || has_auto_name(flg)) {
 		qstring n;
 		get_ea_name(&n, ea);
-		if(!stristr(n.c_str(), VTBL_SUFFIX)) { // avoid renaming derived class vtbl to base one by the redundant assignment in ctor/dtor
+		if(!stristr(n.c_str(), VTBL_SUFFIX)  // avoid renaming derived class vtbl to base one by the redundant assignment in ctor/dtor
+			 && strncmp(n.c_str(), "??_7", 4)) // ignore MSVC vtables (mangled names starting with "??_7")
+		{
 			if (name) {
 				*name = n;
-				stripName(name, is_func(flg));
+				stripName(name, isFuncOrFuncptr(ea));
 			}
 			return true;
 		}
@@ -322,28 +334,29 @@ bool renameVar(ea_t refea, cfunc_t *func, ssize_t varIdx, const qstring* name, v
 	}
 
 	//check if proc doesnt already has such name
-	newName = unique_name(newName.c_str(), "_",
-												[&refea, &vars, &var](const qstring &n)
+	newName = unique_nameD(newName.c_str(), "_", [&vars, &var](const qstring &n)
 	{
 		for(auto it = vars->begin(); it != vars->end(); it++) {
 			if(it->name == n) {
-				if(it == var) {//old name is equal to new, why?
-					Log(llDebug, "FIXME: renameVar(%a, \"%s\") dup\n", refea, n.c_str());
-					return true;
-				}
+				if(it == var)
+					return true; // old name is equal to new, why? just return it's unique, and handle outside lambda
 				return false;
 			}
 		}
-		// it seems ida donsnt allow renaming local var to the name of existing proc, but OK with global var
-		ea_t nnea = get_name_ea(BADADDR, n.c_str());
-		if(nnea == BADADDR || !is_func(get_flags(nnea)))
-			return true;
-		Log(llDebug, "FIXME: renameVar(%a, \"%s\") not accepted\n", refea, n.c_str());
-		return false;
+		return true;
 	});
 
-	bool res = true;
 	qstring oldname = var->name;
+	if(oldname == newName && // old name is equal to new, why?
+		!(var->has_nice_name() && !var->has_user_name())) // pass to process renaming the same decompiler's nice name
+	{
+		if(isVarNameGood(oldname.c_str())) //it possible on renaming to bad name
+			Log(llDebug, "FIXME: renameVar(%a, \"%s\") dup\n", refea, oldname.c_str());
+		return false;
+	}
+
+	bool res = true;
+
 	if (vdui) {
 		res = vdui->rename_lvar(var, newName.c_str(), true); // vdui->rename_lvar can rebuild all internal structures/ call later!!!
 	} else {
@@ -413,7 +426,7 @@ static bool isStructOffOver(cexpr_t* memref, const cfunc_t *func)
 		while(memref->x->op == cot_memref)
 			memref = memref->x;
 		if(memref->x->op == cot_idx && memref->x->y->op == cot_num && memref->x->y->numval() > 0 /*&& memref->x->type.is_struct()*/) {//is it possible case for union?
-			printExp2Msg(func, memref, "probably invalid struct member access");
+			LogExpr(llDebug, func, memref, "probably invalid struct member access");
 			return true;
 		}
 	}
@@ -595,10 +608,19 @@ bool getExpName(cfunc_t *func, cexpr_t* exp, qstring* name, bool derefPtr /* =fa
 bool renameExp(ea_t refea, cfunc_t *func, cexpr_t* exp, qstring* name, vdui_t *vdui, bool derefPtr /*= false*/)
 {
 	exp = skipCast(exp);
-	if(derefPtr && exp->op == cot_ptr && isRenameble(exp->x->op) && exp->x->type.is_scalar() && !getExpName(func, exp->x, nullptr)) {
+#if 1
+	if(derefPtr && exp->op == cot_ptr && isRenameble(skipCast(exp->x)->op) && exp->x->type.is_scalar() && !getExpName(func, exp->x, nullptr)) {
 		name->insert(0,"p_");
 		return renameExp(refea, func, exp->x, name);
 	}
+#else
+	//Experimental: may produce a lot of false "p_smth" names
+	//??? check if exp->x is an arg
+	if(exp->op == cot_ptr && isRenameble(skipCast(exp->x)->op) && !getExpName(func, exp->x, nullptr)) {
+		name->insert(0,"p_");
+		return renameExp(refea, func, exp->x, name);
+	}
+#endif
 	if(derefPtr && exp->op == cot_ref && isRenameble(exp->x->op)) {
 		qstring xname;
 		if(!getExpName(func, exp->x, &xname) || xname == *name) {
@@ -639,7 +661,7 @@ bool renameExp(ea_t refea, cfunc_t *func, cexpr_t* exp, qstring* name, vdui_t *v
 	return false;
 }
 
-static tinfo_t getExpType(cfunc_t *func, cexpr_t* exp)
+tinfo_t getExpType(cfunc_t *func, cexpr_t* exp)
 {
 	if(!exp->type.empty())
 		return exp->type;
@@ -836,52 +858,60 @@ void autorename_n_pull_comments(cfunc_t *cfunc)
 			if(asgn->op != cot_asg && !is_relational(asgn->op))
 				return 0;
 
-			// find comments on this ea
-			qstring comments;
+			// get newName from comments on this ea
+			qstring newName;
 			treeloc_t loc;
 			loc.ea = asgn->ea;
 			loc.itp = ITP_SEMI;
 			user_cmts_iterator_t it = user_cmts_find(cmts, loc);//get existing comments
 			if(it != user_cmts_end(cmts)) {
-				comments = user_cmts_second(it);
+				newName = user_cmts_second(it);
 			} else {
 				loc.itp = ITP_BLOCK1;
 				it = user_cmts_find(cmts, loc);
 				if(it != user_cmts_end(cmts))
-					comments = user_cmts_second(it);
+					newName = user_cmts_second(it);
 			}
 			//do not use comments been set by enum detector (see helpers.cpp appendComment)
-			if (comments.length() && comments[0] == ';')
-				comments.clear();
+			if (!newName.empty() && newName[0] == ';')
+				newName.clear();
 
 			//get name from right side of assignment
 			qstring rname;
 			cexpr_t* right = asgn->y;
-			getExpName(func, right, &rname, true);
-
-			//have some name on right side?
 			bool renameLeft = false;
-			if (comments.length() || rname.length()) {
+			if(getExpName(func, right, &rname, true)) //is named exp on right side?
+				newName = rname; //assume rname more important then comments
+			if(!newName.empty())
 				renameLeft = true;
-				if(rname.length()) //assume rname more important then comments
-					comments = rname;
-			}
 
 			//take name of left side assigned var
 			//and rename it if possible
 			qstring lname;
 			cexpr_t* left = asgn->x;
 			bool hasLeft = getExpName(func, left, &lname);
-			if(hasLeft && skipCast(right)->op == cot_ref && lname[0] == 'p' && lname[1] == '_' && strncmp(comments.c_str(), "p_", 2)) // overwrite unbalanced with type annoying IDA's renaming to "p_something"
+
+			if(hasLeft && rname.length() > 2 && skipCast(right)->op == cot_ref && lname[0] == 'p' && lname[1] == '_' && (rname[0] != 'p' || rname[1] != '_' )) {
+				Log(llFlood, "%a: rename asgn ignore left side \"%s = &%s\"\n", asgn->ea, lname.c_str(), rname.c_str());
 				hasLeft = false;
-			if(!hasLeft && renameLeft)
-				varRenamed |= renameExp(asgn->ea, func, left, &comments);
+			}
+
+			if(!hasLeft && renameLeft) {
+				Log(llFlood, "%a: renaming asgn left side '%s' to '%s'\n", asgn->ea, DSTR(left), newName.c_str());
+				varRenamed |= renameExp(asgn->ea, func, left, &newName);
+			}
 
 			//rename right if have good name on left side
-			if(!rname.length() && (hasLeft || renameLeft)) {
-				if(lname.length())//assume lname more important then comments
-					comments = lname;
-				varRenamed |= renameExp(asgn->ea, func, right, &comments);
+			if(rname.empty() && (hasLeft || renameLeft)) {
+				if(!lname.empty())//assume lname more important then comments
+					newName = lname;
+
+				if (skipCast(right)->op == cot_obj && (left->op == cot_memptr || left->op == cot_memref) && !left->m) {
+					Log(llDebug, "%a: avoid renaming vtbl to base class member '%s' to '%s'\n", asgn->ea, DSTR(right), newName.c_str());
+				}	else {
+					Log(llFlood, "%a: renaming asgn right side '%s' to '%s'\n", asgn->ea, DSTR(right), newName.c_str());
+					varRenamed |= renameExp(asgn->ea, func, right, &newName);
+				}
 			}
 			return 0;
 		}
@@ -893,11 +923,10 @@ void autorename_n_pull_comments(cfunc_t *cfunc)
 			callCnt++;
 
 			ea_t dstea;
-			tinfo_t tif = getCallInfo(call, &dstea);
+			tinfo_t tif = getCallInfo(func, call, &dstea);
 			bool bAllowTypeChange =  false;
 			if(dstea != BADADDR && !tif.is_from_subtil()) {
-				func_t *f = get_func(dstea);
-				if(f && !(f->flags & FUNC_LIB)) {
+				if(!(get_func_flags(dstea) & FUNC_LIB)) {
 					//do check number of crefs for avoid renaming args in popular funcs like memcpy, alloc, etc
 					uint32 nref = 0;
 					for(ea_t xrefea = get_first_cref_to(dstea); xrefea != BADADDR && ++nref <= cfg.tooPopularFuncCRefCnt; xrefea = get_next_cref_to(dstea, xrefea))
@@ -961,27 +990,31 @@ void autorename_n_pull_comments(cfunc_t *cfunc)
 						}
 
 						if(!argNamed && isArgNameGood(fiIname.c_str())) {
-								varRenamed |= renameExp(call->ea, func, arg, &fiIname, nullptr, true);
+							Log(llFlood, "%a: renaming arg '%s' to '%s'\n", call->ea, DSTR(arg), fiIname.c_str());
+							varRenamed |= renameExp(call->ea, func, arg, &fiIname, nullptr, true);
 						} else if(argNamed && bAllowTypeChange && !isVarNameGood(fiIname.c_str())) {
-								Log(llDebug, "%a %s: In function %a %s rename arg%d \"%s\" to \"%s\"\n", call->ea, funcname.c_str(), dstea, get_short_name(dstea).c_str(), i + 1, fi[i].name.c_str(), argVarName.c_str());
-								fi[i].name = argVarName;
-								fiChanged = true;
-								if(isDummyType(fi[i].type.get_decltype())) {
-									tinfo_t argType = getType4Name(argVarName.c_str());
-									if(argType.empty())
-										argType = getExpType(func, skipCast(arg));
-									if(!isDummyType(argType.get_decltype()) && argType.is_scalar()) {
-										Log(llDebug, "%a %s: In function %a %s recasted arg%d `%s` from \"%s\" to \"%s\"\n", 	call->ea, funcname.c_str(), dstea, get_short_name(dstea).c_str(), i + 1, fi[i].name.c_str(), fi[i].type.dstr(), argType.dstr());
-										fi[i].type = argType;
-									}
-								} //else Log(llDebug, "arg%d `%s` (%d - %s) of %s\n", i + 1, fi[i].name.c_str(), fi[i].type.get_decltype(), fi[i].type.dstr(), get_short_name(dstea).c_str());
+							Log(llDebug, "%a %s: In function %a %s rename arg%d \"%s\" to \"%s\"\n", call->ea, funcname.c_str(), dstea, get_short_name(dstea).c_str(), i + 1, fi[i].name.c_str(), argVarName.c_str());
+							fi[i].name = argVarName;
+							fiChanged = true;
+							if(isDummyType(fi[i].type.get_decltype())) {
+								tinfo_t argType = getType4Name(argVarName.c_str());
+								if(argType.empty())
+									argType = getExpType(func, skipCast(arg));
+								if(!isDummyType(argType.get_decltype()) && argType.is_scalar()) {
+									Log(llDebug, "%a %s: In function %a %s recasted arg%d `%s` from \"%s\" to \"%s\"\n", 	call->ea, funcname.c_str(), dstea, get_short_name(dstea).c_str(), i + 1, fi[i].name.c_str(), fi[i].type.dstr(), argType.dstr());
+									fi[i].type = argType;
+								}
+							} //else Log(llDebug, "arg%d `%s` (%d - %s) of %s\n", i + 1, fi[i].name.c_str(), fi[i].type.get_decltype(), fi[i].type.dstr(), get_short_name(dstea).c_str());
 						}
 					}
 					if(bCallAssign) {
-						if(!anL.length() && anR.length())
+						if(!anL.length() && anR.length()) {
+							Log(llFlood, "%a: renaming arg left '%s' to '%s'\n", call->ea, DSTR(&args[iL]), anR.c_str());
 							varRenamed |= renameExp(call->ea, func, &args[iL], &anR, nullptr, true);
-						else if(anL.length() && !anR.length())
+						} else if(anL.length() && !anR.length()) {
+							Log(llFlood, "%a: renaming arg right '%s' to '%s'\n", call->ea, DSTR(&args[iR]), anL.c_str());
 							varRenamed |= renameExp(call->ea, func, &args[iR], &anL, nullptr, true);
+						}
 					}
 					if(fiChanged) {
 						//TODO: some name cleanup, remove duplicates (?)
@@ -1061,7 +1094,10 @@ void autorename_n_pull_comments(cfunc_t *cfunc)
 			qstring strcontent;
 			if (!get_opinfo(&oi, ea, 0, flg))
 				oi.strtype = STRTYPE_C;
-			if (get_strlit_contents(&strcontent, ea, (size_t)(get_item_end(ea) - ea), oi.strtype, NULL, STRCONV_ESCAPE) > 0) {
+			size_t len = get_item_end(ea) - ea;
+			if(len > MAX_NAME_LEN * 2)
+				len = MAX_NAME_LEN * 2;
+			if (get_strlit_contents(&strcontent, ea, len, oi.strtype, NULL, STRCONV_ESCAPE) > 0) {
 				strcontent.insert('"');
 				strcontent.append('"');
 				func->set_user_cmt(loc, strcontent.c_str());
@@ -1084,8 +1120,8 @@ void autorename_n_pull_comments(cfunc_t *cfunc)
 		void apply_loop()
 		{
 			uint32 i = 0;
-			for(; i < 10; ++i)
-			{
+			for(; i < 10; ++i) {
+				Log(llFlood, "%a %s: autorename pass %u\n", func->entry_ea, funcname.c_str(), i);
 				varRenamed = false;
 				apply_to(&func->body, NULL);
 				if(!varRenamed)
@@ -1116,8 +1152,28 @@ void autorename_n_pull_comments(cfunc_t *cfunc)
 				}
 			}
 		}
-
 	};
+#if 0
+	// delete all decompiler generated var-names
+	lvars_t *vars = cfunc->get_lvars();
+	for (size_t varIdx = 0; varIdx < vars->size(); varIdx++) {
+		lvar_t* var = &vars->at(varIdx);
+		if(!var->has_user_name() && var->has_nice_name()
+			 //&& isVarNameGood(var->name.c_str())
+			 //&& var->name[0] == 'p' && var->name[1] == '_'
+			) {
+			Log(llDebug, "%a: kill var-name '%s' defined at %a\n", cfunc->entry_ea, var->name.c_str(), var->defea);
+			qstring newName = unique_nameD(var->is_arg_var() ? "a99" : "v99", "_", [&vars](const qstring &n){	for(auto &v : *vars) if(v.name == n) return false; return true;	});
+#if IDA_SDK_VERSION < 830
+			var->name = newName;
+			var->set_user_name();
+#else // IDA_SDK_VERSION >= 830
+			cfunc->mba->set_lvar_name(*var, newName.c_str(), 0);
+#endif // IDA_SDK_VERSION < 830
+		}
+	}
+#endif
+
 	cblock_visitor_t cbv(cfunc);
 	cbv.apply_loop();
 	//cfunc->verify(ALLOW_UNUSED_LABELS, false);

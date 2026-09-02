@@ -131,7 +131,7 @@ struct ida_local refac_t {
 	TWidget* rfform = nullptr;
 	qstring searchFor;
 	qstring replaceWith;
-	ushort flags = RFF_WWORDS; // see RFF_* above
+	ushort flags = RFF_CASESN | RFF_WWORDS; // see RFF_* above
 	rf_matches_t matches;
 	regex_ptr_t re;
 #if IDA_SDK_VERSION >= 770
@@ -283,10 +283,9 @@ struct ida_local refac_t {
 		// func name, type, local vars and comments
 		size_t funcqty = get_func_qty();
 		for (size_t i = 0; i < funcqty; i++) {
-			func_t* func = getn_func(i);
-			if(!func || (func->flags & FUNC_LIB))
+			ea_t ea = get_func_ea_by_num(i);
+			if(ea == BADADDR || (get_func_flags(ea) & FUNC_LIB))
 				continue;
-			ea_t ea = func->start_ea;
 			qstring eaname = get_name(ea);
 
 			//match name of functions an global vars
@@ -313,7 +312,7 @@ struct ida_local refac_t {
 				}
 			}
 
-#ifndef _DEBUG // restore_user_lvar_settings may cause crash somewhere deep inside decompiler on access nullptr exception on Windows in Debug mode (prbbl because of std::map)
+#if IDA_SDK_VERSION >= 930 || !defined(_DEBUG) // restore_user_lvar_settings may cause crash on early IDA versions somewhere deep inside decompiler on access nullptr exception on Windows in Debug mode (prbbl because of std::map)
 			//match func local vars
 			lvar_uservec_t lvinf;
 			if(restore_user_lvar_settings(&lvinf, ea)) {
@@ -331,7 +330,7 @@ struct ida_local refac_t {
 					add(nn.c_str(), eRF_loclVar, ea);
 				}
 			}
-#endif
+#endif //IDA_SDK_VERSION >= 930 || !defined(_DEBUG)
 
 			//match func local comments
 			user_cmts_t *cmts = restore_user_cmts(ea);
@@ -477,7 +476,7 @@ struct ida_local refac_t {
 		return true;
 	}
 
-	void replace()
+	bool replace()
 	{
 		Log(llDebug, "Refactoring '%s' -> '%s': replace %d matches \n", searchFor.c_str(), replaceWith.c_str(), matches.size());
 		uint32 count = 0;
@@ -521,7 +520,7 @@ struct ida_local refac_t {
 								qstring newname;
 								if(match(fi[i].name, &newname)) {
 									stripName(&newname);
-									newname = unique_name(newname.c_str(), "_", [&fi, i](const qstring &n)
+									newname = unique_nameD(newname.c_str(), "_", [&fi, i](const qstring &n)
 									{
 										for(size_t j = 0; j < fi.size(); j++){
 											if(fi[i].name == n) {
@@ -554,7 +553,7 @@ struct ida_local refac_t {
 			}
 			case eRF_loclVar:
 			{
-#ifndef _DEBUG   // restore_user_lvar_settings may cause crash somewhere deep inside decompiler on access nullptr exception on Windows in Debug mode
+#if IDA_SDK_VERSION >= 930 || !defined(_DEBUG) // restore_user_lvar_settings may cause crash on early IDA versions somewhere deep inside decompiler on access nullptr exception on Windows in Debug mode
 			  // save_user_lvar_settings cause internal error 1099 on the same sample
 				lvar_uservec_t lvinf;
 				if(is_func(get_flags(m.ea)) && restore_user_lvar_settings(&lvinf, m.ea)) {
@@ -563,7 +562,7 @@ struct ida_local refac_t {
 						qstring newname;
 						if(match(lvinf.lvvec[i].name, &newname)) {
 							stripName(&newname);
-							newname = unique_name(newname.c_str(), "_", [&lvinf, i](const qstring &n)
+							newname = unique_nameD(newname.c_str(), "_", [&lvinf, i](const qstring &n)
 							{
 								for(size_t j = 0; j < lvinf.lvvec.size(); j++){
 									if(lvinf.lvvec[j].name == n) {
@@ -588,14 +587,14 @@ struct ida_local refac_t {
 				}
 				++failc;
 				Log(llWarning, "Refactoring %a: fail local vars renaming '%s'\n", m.ea, m.name.c_str());
-#endif
+#endif // IDA_SDK_VERSION >= 930 || !defined(_DEBUG)
 				break;
 			}
 			case eRF_usrCmts:
 			{
 				user_cmts_t *cmts = nullptr;
-				func_t *fn = get_func(m.ea);
-				if(fn && (cmts = restore_user_cmts(fn->start_ea)) != nullptr) {
+				ea_t start_ea = get_func_start(m.ea);
+				if(start_ea != BADADDR && (cmts = restore_user_cmts(start_ea)) != nullptr) {
 					uint32 changed = 0;
 					for(auto it = user_cmts_begin(cmts); it != user_cmts_end(cmts); it = user_cmts_next(it)) {
 						if(user_cmts_first(it).ea == m.ea) {
@@ -608,7 +607,7 @@ struct ida_local refac_t {
 						}
 					}
 					if(changed) {
-						save_user_cmts(fn->start_ea, cmts);
+						save_user_cmts(start_ea, cmts);
 						user_cmts_free(cmts);
 						count += changed;
 						Log(llInfo, "Refactoring %a: %d local comments replaced\n", m.ea, changed);
@@ -623,8 +622,8 @@ struct ida_local refac_t {
 			case eRF_numFmt:
 			{
 				user_numforms_t *nfs = nullptr;
-				func_t *fn = get_func(m.ea);
-				if(fn && (nfs = restore_user_numforms(fn->start_ea)) != nullptr) {
+				ea_t start_ea = get_func_start(m.ea);
+				if(start_ea != BADADDR && (nfs = restore_user_numforms(start_ea)) != nullptr) {
 					uint32 changed = 0;
 					for(auto it = user_numforms_begin(nfs); it != user_numforms_end(nfs); it = user_numforms_next(it)) {
 						if(user_numforms_first(it).ea == m.ea) {
@@ -637,7 +636,7 @@ struct ida_local refac_t {
 						}
 					}
 					if(changed) {
-						save_user_numforms(fn->start_ea, nfs);
+						save_user_numforms(start_ea, nfs);
 						user_numforms_free(nfs);
 						count += changed;
 						Log(llInfo, "Refactoring %a: %d user defined number formats replaced\n", m.ea, changed);
@@ -738,8 +737,7 @@ struct ida_local refac_t {
 		}
 
 		Log(llNotice, "Refactoring '%s' -> '%s': %d changes, %d fails\n", searchFor.c_str(), replaceWith.c_str(), count, failc);
-		if(count)
-			clear_cached_cfuncs();
+		return count > 0;
 	}
 };
 
@@ -792,16 +790,10 @@ qstring msig_replace(void* ctx, const char* name)
 }
 
 //--------------------------------------------------------------------------
-static const int rcwidths[] = 
-{ 
+static const int rcwidths[] =
+{
 	// "Found" column
-	45 | CHCOL_PLAIN 
-#if IDA_SDK_VERSION < 930
-	| CHCOL_INODENAME
-#else
-	| OBSOLETE_CHCOL_INODENAME
-#endif //IDA_SDK_VERSION < 930
-	,
+	45 | CHCOL_PLAIN | CHCOL_INODENAME,
 
 	// "Replace to" column
 	45 | CHCOL_PLAIN,
@@ -823,11 +815,9 @@ struct ida_local rf_chooser_t : public chooser_t
 	int problemIcon = -1;
 
 	rf_chooser_t(refac_t* rf_) : chooser_t(
-#if IDA_SDK_VERSION >= 770 && IDA_SDK_VERSION < 930
-																 CH_HAS_DIRTREE | CH_TM_FULL_TREE | CH_NON_PERSISTED_TREE |
-#elif IDA_SDK_VERSION >= 930
-																 OBSOLETE_CH_HAS_DIRTREE | OBSOLETE_CH_TM_FULL_TREE | OBSOLETE_CH_NON_PERSISTED_TREE |
-#endif //IDA_SDK_VERSION >= 770 && IDA_SDK_VERSION < 930
+#if IDA_SDK_VERSION >= 770
+																 CH_HAS_DIRTREE | CH_TM_FULL_TREE | CH_NON_PERSISTED_TREE | CH_NO_STATUS_BAR |
+#endif //IDA_SDK_VERSION >= 770
 																 CH_CAN_DEL, qnumber(rcwidths), rcwidths, rcheader, "[hrt] Refactoring"), rf(rf_)
 	{
 		get_action_icon("OpenProblems", &problemIcon);
@@ -977,8 +967,24 @@ static int idaapi callback(int fid, form_actions_t &fa)
 		} else if(!rf->validateReplace()) {
 			warning("[hrt] bad replace: '%s'", rf->replaceWith.c_str());
 			break;
-		} else {
-			rf->replace();
+		} else if(rf->replace()) {
+			//clear_cached_cfuncs(); // it cleans cache used by "Global cross refs", that bad for refactoring work process
+
+			mark_builtin_widgets(IWID_ALL); // it doesn't refresh pseudocode
+#if 1
+			//refresh currently displayed pseudocode / replace 'C' to 'Z' for all of them
+			for(char i = 'A'; i <= 'C' ; i++) {
+				qstring wn; wn.sprnt("Pseudocode-%c", i);
+				TWidget *w = find_widget(wn.c_str());
+				if(w) {
+					vdui_t *vd = get_widget_vdui(w);
+					if(vd) {
+						vd->refresh_view(true); // it steals focus with `false` arg
+						//vd->refresh_ctext(false); // is doesn't work
+					}
+				}
+			}
+#endif
 		}
 		close_widget(rf->rfform, 0);
 		break;
@@ -1040,9 +1046,11 @@ static int idaapi callback(int fid, form_actions_t &fa)
 	return 1;
 }
 
+#define REFACTTITLE "[hrt] Refactoring"
+
 int do_refactoring(action_activation_ctx_t *ctx)
 {
-	TWidget *widget = find_widget("[hrt] Refactoring");
+	TWidget *widget = find_widget(REFACTTITLE);
   if(widget) {
 		activate_widget(widget, true);
     return 0;
@@ -1056,7 +1064,7 @@ int do_refactoring(action_activation_ctx_t *ctx)
 	rf_chooser_t* rfch = new rf_chooser_t(refac);
   sizevec_t selected;
   selected.push_back(0);  // first item by default
-	
+
 	static const char form[] =
 //		"STARTITEM 2\n" // to put the cursor on replaceWith field
 		"BUTTON YES* ~R~eplace\n"
@@ -1064,13 +1072,25 @@ int do_refactoring(action_activation_ctx_t *ctx)
     // has no action callback in early IDA versions
 	  "BUTTON CANCEL NONE\n"
 #endif //IDA_SDK_VERSION < 800
-		"[hrt] Refactoring\n"   // title
+		REFACTTITLE         // title
+		"\n\n"
+		"%/%*"              // callback
 		"\n"
-		"%/%*"                    // callback
-		"\n"
-		"<~L~ist:E0:0:100:::>\n"
-		"<~S~earch for:q1:::><|><Re~p~lace with:q2:::>\n"
-		"<~C~ase sensitive:c><|><Whole words onl~y~:c><|><Use re~g~ular expression:c>3>\n\n"; //!!! check RFF_ flags in case of changes in this line
+		"<:E0:0:100:::>\n"
+		"<~S~earch:q1:::><|><Re~p~lace:q2:::><|>"
+		"<#Case sensitive#~C~ase:c><|><#Whole words only#Words:c><|><#Use regular expression for search#Re~g~exp:c>3>"; //!!! check RFF_ flags in case of changes in this line
 	refac->rfform = open_form(form, WOPN_RESTORE, callback, refac, rfch, &selected, &refac->searchFor, &refac->replaceWith, &refac->flags);
+
+	// both docking below works well, but floating Refactoring window is better for my taste
+#if 0
+	// dock on right side of "Output" window -- too small part of the list is visible
+	set_dock_pos(REFACTTITLE, "Output", DP_RIGHT);
+#elif 0
+	// dock on right side of currently active window
+	TWidget *w = get_current_widget();
+	qstring cwt;
+	if(w && get_widget_title(&cwt, w))
+		set_dock_pos(REFACTTITLE, cwt.c_str(), DP_RIGHT);
+#endif
 	return 0;
 }

@@ -98,7 +98,7 @@ struct read_ioports_cb_t : public ioports_fallback_t
 	uint32 d5[6];
 	char name[1024];
 	name[0] = 0;
-	if (11 != qsscanf(line, "guid {%x-%hx-%hx-%hx-%2x%2x%2x%2x%2x%2x} %1024s", 
+	if (11 != qsscanf(line, "guid {%x-%hx-%hx-%hx-%2x%2x%2x%2x%2x%2x} %1024s",
 		&guid.uid.u.m1.d1, &guid.uid.u.m1.d2, &guid.uid.u.m1.d3, &guid.uid.u.m1.d4,
 		&d5[0], &d5[1], &d5[2], &d5[3], &d5[4], &d5[5], name))
 		return "bad guid format";
@@ -184,14 +184,14 @@ static bool com_find_guid_type(ea_t ea, flags64_t flags, qstring* tname = NULL)
 			vtname += "Vtbl";
 			if (BADADDR == get_struc_id(vtname.c_str())) {
 				const char* verb = (BADNODE != import_type(get_idati(), -1, vtname.c_str(), 0)) ? "imported" : "not found";
-				Log(llNotice, "%a: type '%s' was %s\n", ea, vtname.c_str(), verb);
+				Log(llInfo, "%a: type '%s' was %s\n", ea, vtname.c_str(), verb);
 			}
 
 			tid_t res = get_struc_id(it->name.c_str());
 			if (BADNODE == res) {
 				res = import_type(get_idati(), -1, it->name.c_str(), 0);
 				const char* verb = (BADNODE != res) ? "imported" : "not found";
-				Log(llNotice, "%a: type %s was %s\n", ea, it->name.c_str(), verb);
+				Log(llInfo, "%a: type %s was %s\n", ea, it->name.c_str(), verb);
 
 			}
 #endif // IDA_SDK_VERSION < 850
@@ -213,7 +213,7 @@ void com_make_data_cb(ea_t ea, flags64_t flags, tid_t tid, asize_t len)
 		return;
 
 	qstring tname;
-	if (!get_tid_name(&tname, tid)) 
+	if (!get_tid_name(&tname, tid))
 		return;
 
 	if (tname.empty() || !isGUIDtypeName(tname.c_str()))
@@ -279,7 +279,7 @@ bool chkCall(cexpr_t *call, qstring &comment)
 	bool has_func_type_data = false;
 	func_type_data_t fi;
 	ea_t calldstea;
-	tinfo_t tif = remove_pointer(getCallInfo(call, &calldstea));
+	tinfo_t tif = remove_pointer(getCallInfo(func, call, &calldstea));
 	//default get_func_details() call may cause INTERR 50689
 	if (tif.is_decl_func() && tif.get_func_details(&fi, GTD_NO_ARGLOCS) && fi.size() == args.size())
 		has_func_type_data = true;

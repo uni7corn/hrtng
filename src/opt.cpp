@@ -278,7 +278,7 @@ minsn_t* my_find_def_backwards(mblock_t* mb, mlist_t& ml, minsn_t* start)
 {
 	for (minsn_t* p = start != NULL ? start : mb->tail; p != NULL; p = p->prev) {
 		mlist_t def = mb->build_def_list(*p, /*MAY_ACCESS*/ MUST_ACCESS | FULL_XDSU);//may-list includes all aliasable memory in case of indirect stx
-		if (def.includes(ml))
+		if(def.has_common(ml)) //if (def.includes(ml)) // doesnt catch when `rax` in `ml` and `eax` in `def` 
 			return p;
 	}
 	return NULL;
@@ -293,17 +293,17 @@ static bool FindInsWithTheOp(mblock_t* blk, mop_t* op, minsn_t* start, minsn_t*&
 	minsn_t* mStart = start;
 	do {
 		minsn_t* mDef = my_find_def_backwards(blk, ml, mStart);
-		if (mDef == NULL) {
+		if(!mDef) {
 			// move to previous block
 			blk = blk->prevb;
-			mStart = NULL;
+			mStart = nullptr;
 		} else {
 			if (mDef->opcode == opcode && (opt == 0 || opt == mDef->l.t)) {
 				ins = mDef;
 				return true;
 			}
 
-			if (mDef->opcode == m_mov) {
+			if (mDef->opcode == m_mov || mDef->opcode == m_xdu || mDef->opcode == m_xds || mDef->opcode == m_low) {
 				ml.clear();
 				if (!InsertOp(blk, ml, &mDef->l))
 					return false;
@@ -316,9 +316,17 @@ static bool FindInsWithTheOp(mblock_t* blk, mop_t* op, minsn_t* start, minsn_t*&
 #endif
 				return false;
 			}
-			mStart = mDef;
+			if(mDef->prev) {
+				mStart = mDef->prev;
+			} else {
+				// move to previous block
+				if (blk->npred() != 1)
+					return false;
+				blk = blk->mba->get_mblock(blk->pred(0));
+				mStart = nullptr;
+			}
 		}
-	} while (blk->prevb != NULL);
+	} while(blk);
 	return false;
 }
 
@@ -602,24 +610,31 @@ bool replaceReadOnlyInitedVar2Val(mop_t* op)
 		return false;
 
 	// The variable is in a writable section? (e.g., .data section)
+#if IDA_SDK_VERSION < 940
 	segment_t* s = getseg(op->g);
 	if(!s || s->perm != (SEGPERM_READ | SEGPERM_WRITE)) // TODO: section with IMAGE_SCN_CNT_INITIALIZED_DATA?
 		return false;
-
+#else // IDA_SDK_VERSION >= 940
+	segment_info_t s;
+	if (!get_segment_info(&s, op->g) || s.get_perm() != (SEGPERM_READ | SEGPERM_WRITE)) // TODO: section with IMAGE_SCN_CNT_INITIALIZED_DATA?
+		return false;
+#endif //IDA_SDK_VERSION < 940
 	// The variable doesn't have xrefsTo with write access?
 	xrefblk_t xb;
 	for (bool ok = xb.first_to(op->g, XREF_DATA); ok; ok = xb.next_to())
 		if (xb.type == dr_W)
 			return false;
 
-	uint64 val;
-	switch(op->size) {
-	case 1: val = get_byte(op->g); break;
-	case 2: val = get_word(op->g); break;
-	case 4: val = get_dword(op->g); break;
-	case 8: val = get_qword(op->g); break;
-	default:
-		return false;
+	uint64 val = 0;
+	if(is_loaded(op->g)) {
+		switch(op->size) {
+		case 1: val = get_byte(op->g); break;
+		case 2: val = get_word(op->g); break;
+		case 4: val = get_dword(op->g); break;
+		case 8: val = get_qword(op->g); break;
+		default:
+			return false;
+		}
 	}
 
 	MSG_DO(("[I] replaceReadOnlyInitedVar2Val: '%s'", op->dstr()));
@@ -633,8 +648,8 @@ bool replaceReadOnlyInitedVar2Val(mop_t* op)
 static bool pat_InitedVarCondImm(minsn_t*& ins, mblock_t* blk)
 {
 #if RO_GVAR
-	if (ins->opcode == m_seto && (blk == NULL || blk->mba->maturity <= MMAT_LOCOPT))
-		return false;
+	//if (ins->opcode == m_seto && (blk == NULL || blk->mba->maturity <= MMAT_LOCOPT))
+	//	return false;
 
 	mop_t* condNum;
 	mop_t* condNonNum;
@@ -646,14 +661,17 @@ static bool pat_InitedVarCondImm(minsn_t*& ins, mblock_t* blk)
 
 	if(replaceReadOnlyInitedVar2Val(condNonNum))
 		return true;
-
-	if (blk == NULL)
+#if 1
+	return false;
+#else
+	if(!blk)
 		return false;
 	// data flow tracking
 	minsn_t* insOut;
-	if (!FindInsWithTheOp(blk, condNonNum, ins, insOut, m_mov, mop_v))
+	if(!FindInsWithTheOp(blk, condNonNum, ins, insOut, m_mov, mop_v))
 		return false;
 	return replaceReadOnlyInitedVar2Val(&insOut->l);
+#endif
 #else
 	return false;
 #endif
@@ -665,8 +683,8 @@ static bool pat_InitedVarCondImm(minsn_t*& ins, mblock_t* blk)
 static bool pat_InitedVarSubImmCond0(minsn_t* ins, mblock_t* blk)
 {
 #if RO_GVAR
-	if (blk == NULL || blk->mba->maturity <= MMAT_LOCOPT)
-		return false;
+	//if (blk == NULL || blk->mba->maturity <= MMAT_LOCOPT)
+	//	return false;
 
 	minsn_t* insSub;
 	if (!ins->l.is_insn(m_sub))
@@ -1090,20 +1108,30 @@ bool OptimizeInsn(mop_t* op, minsn_t* ins, mblock_t* blk)
 		return pat_LnotOrLnotLnot(ins, blk) || pat_LogicAnd1(ins, blk);
 	case m_lnot:
 		return pat_LnotOrLnotLnot(ins, blk);
+	case m_sets:
+	case m_seto:
+	case m_setp:
+	//case m_setnz:
+	//case m_setz:
+	case m_setae:
+	case m_setb:
+	case m_seta:
+	case m_setbe:
+	case m_setg:
+	case m_setge:
 	case m_setl:
+	case m_setle:
 	case m_jl:
 	case m_jge:
-	case m_seto: // cause INTERR 50862 -> replace in later maturity level
-		return pat_InitedVarCondImm(ins, blk);
-	case m_sets:
-		return pat_InitedVarSubImmCond0(ins, blk);
+		return pat_InitedVarCondImm(ins, blk) // may cause INTERR 50862 -> replace in later maturity level
+		|| pat_InitedVarSubImmCond0(ins, blk);
 	case m_mov:
 		return pat_InitedVarMov(ins);// data-flow tracking required
 	case m_add:
 	case m_sub:
 		return pat_AddSub(ins, blk);
 	case m_call:
-		return call_ARITH(ins, blk) 
+		return call_ARITH(ins, blk)
 			|| call_ARITH_0xNN(op, ins, blk)
 			|| bswap_const_to_const(op, ins);
 	case m_jz:

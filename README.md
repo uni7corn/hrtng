@@ -20,23 +20,23 @@ The plugin's menu items placed closer to logically related standard IDA & Hex-Ra
 Messages, menu items, popup windows and dialog boxes belong to this plugin are marked with "`[hrt]`" prefix.
 
 ### Automation
-  * [Pull up comments from disasm to pseudocode view](doc/pull-cmt.md)
   * [Automatic renaming local and global variables, struct members](doc/var-auto-rename.md)
-  * [Automatic enum substitution](doc/enum.md)
+  * [Auto-comments](doc/auto-cmt.md)
+  * [Enum substitution](doc/enum.md)
   * [COM helper](doc/com-helper.md)
 
 ### Interactive pseudocode transformation
   * [User interactive renaming/retyping assistance](doc/rename-recast.md)
   * [Assists with changing type of structure member or local/global variable](doc/recast.md)
-  * [Invert "if" statement](doc/invert-if.md)
   * [reinterpret_cast](doc/reicast.md)
   * [Collapse selection](doc/collapse.md)
   * ["offsetof" convertor](doc/offsetof.md)
+  * [~~Invert "if" statement~~](doc/invert-if.md)
 
 ### Decryption
-  * [Strings/data/const decryption](doc/decr.md)
-  * [Build stack strings (optionally with decryption)](doc/stk-str.md)
-  * [Build array strings (optionally with decryption)](doc/arr-str.md)
+  * [String/data/const decryption](doc/decr.md)
+  * [Build stack string (optionally with decryption)](doc/stk-str.md)
+  * [Build array string (optionally with decryption)](doc/arr-str.md)
   * [Mass strings decryption](doc/appcall.md)
 
 ### Deal with obfuscated code
@@ -57,14 +57,14 @@ Messages, menu items, popup windows and dialog boxes belong to this plugin are m
   * [Union creation for a variable is reused with different types](doc/var-reuse.md)
   * [List of structures with given size, with given offset](doc/struct-sz-off.md)
   * [Assist in creation of new structure definitions](doc/struct-bld.md)
-  * [Finds structures with same "shape" as is used](doc/struct-shape.md)
+  * [Find structures with same "shape" as is used / Create struct from derefs](doc/struct-shape.md)
   * [~~New functionality in Structures view~~](doc/ex-unp-struc.md)
   * [IDC script for interactive merging types across multiple IDBs](bin/idc/merge_types.idc)
 
 ### Virtual/indirect calls assistance
   * [Virtual calls assistance](doc/virtual-calls.md)
   * [Jump to indirect call destination](doc/ijmp.md)
-  * [Fix stack pointer for indirect call](doc/fix-stack.md)
+  * [~~Fix stack pointer for indirect call~~](doc/fix-stack.md)
  
 ### Function name and type
   * [Smart rename func](doc/rename-func.md)
@@ -97,8 +97,8 @@ Messages, menu items, popup windows and dialog boxes belong to this plugin are m
   * [Create patched (DEC) file](doc/create_dec.md)
 
 ### IDA plugin developer help
-  * [Microcode Explorer](doc/mcode-expl.md)
-  * [Ctree graph](doc/ctree-graph.md)
+  * [~~Microcode Explorer~~](doc/mcode-expl.md)
+  * [~~Ctree graph~~](doc/ctree-graph.md)
 
 ## Media
 ### Reversing FinSpy
@@ -114,11 +114,10 @@ Messages, menu items, popup windows and dialog boxes belong to this plugin are m
  * Clone hrtng together with [Crypto++® Library CMake](https://github.com/abdes/cryptopp-cmake) submodule. Or put manually downloaded `cryptopp-cmake` source code to `hrtng/src/cryptopp-cmake` folder.
  
 ```
-cd src
-git clone --recurse-submodules https://github.com/KasperskyLab/hrtng.git
+git clone --depth=1 --recurse-submodules --shallow-submodules https://github.com/KasperskyLab/hrtng.git
 ```
 
- * Copy `IDA_DIR/plugins/hexrays_sdk/include/hexrays.hpp` file to the `include` directory of the IDA SDK. (Not necessary since IDA 9.0/8.5)
+ * For IDA-SDK older version 8.5: copy `IDA_DIR/plugins/hexrays_sdk/include/hexrays.hpp` file to the `include` directory of the IDA SDK.
  * Edit `hrtng/src/CMakeLists.txt` file to set correct path and version of used IDA SDK. To build later with another SDK version you may change cmake's `IDASDK_VER` variable with using `cmake -D`, `ccmake` or `cmake-gui` tools.
  * Create build directory, go into it, configure and build cmake project
 ```
@@ -127,7 +126,7 @@ cmake <path-to/hrtng/src>
 cmake --build . --config Release -j 4 --clean-first
 ```
 
- * On the first build attempt with IDA SDK before version 9.1 there will be compiling error looks like:
+ * For IDA-SDK older version 9.1: On the first build attempt there will be compiling error looks like:
 
 ```
 hrtng/src/deob.cpp:912:60: error: ‘class rangeset_t’ has no member named ‘as_rangevec’

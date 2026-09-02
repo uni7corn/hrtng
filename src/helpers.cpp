@@ -24,11 +24,14 @@
 #include <hexrays.hpp>
 #include <bytes.hpp>
 #include <kernwin.hpp>
+#include <diskio.hpp>
 #include <pro.h>
 #include "warn_on.h"
 
 #include "helpers.h"
 #include "config.h"
+#include "structures.h"
+#include "rename.h"
 
 bool at_atoea(const char * str, ea_t * pea )
 {
@@ -94,7 +97,7 @@ tinfo_t getType4Name(const char *name, bool funcType /*= false*/)
 	const p_list *fields;
 	tinfo_t       t;
 	if(get_named_type(NULL, newName.c_str(), NTF_TYPE, &type, &fields)) {
-		if(is_type_struct(*type))
+		if(is_type_struni(*type))
 			t = create_typedef(newName.c_str());
 		else
 			t.deserialize(NULL, &type, &fields);
@@ -248,8 +251,7 @@ qstring good_udm_name(const tinfo_t &struc, uint64 offInBits, const char *format
 		name.resize(MAX_NAME_LEN - 3);
 	validate_name(&name, VNT_UDTMEM);
 
-	return unique_name(name.c_str(), "_",
-										 [&struc, offInBits](const qstring &n)
+	return unique_nameD(name.c_str(), "_", [&struc, offInBits](const qstring &n)
 	{
 		udm_t m;
 		m.name = n;
@@ -270,8 +272,7 @@ qstring good_smember_name(const struc_t* sptr, ea_t offset, const char *format, 
 		name.resize(MAX_NAME_LEN);
 	//validate_name(&name, VNT_UDTMEM);
 
-	return unique_name(name.c_str(), "_",
-										 [&sptr, offset](const qstring &n)
+	return unique_nameD(name.c_str(), "_", [&sptr, offset](const qstring &n)
 	{
 
 		member_t *m = get_member_by_name(sptr, n.c_str());
@@ -296,15 +297,16 @@ void mk_name_w(qstring& name)
 }
 
 //returns true if constructor
-bool get_class_name(const char* fullName, qstring *classname)
+bool ctor_class_name(const char* fullName, qstring *classname)
 {
 	const char* div = qstrstr(fullName, "::");
 	if(div && div != fullName && qstrlen(div) > 2) {
 		qstring cname(fullName, div - fullName);
-		if(classname)
-			*classname = cname;
-		if(!strncmp(div + 2, "ctor", 4) || !qstrcmp(cname.c_str(), div + 2))
+		if(!strncmp(div + 2, "ctor", 4) || !qstrcmp(cname.c_str(), div + 2)) {
+			if(classname)
+				*classname = cname;
 			return true;
+		}
 	}
 	return false;
 }
@@ -592,15 +594,83 @@ bool setComment4Exp(cfunc_t* func, user_cmts_t *cmts, citem_t *expr, const char*
 	return false;
 }
 
-tinfo_t getCallInfo(cexpr_t *call, ea_t* dstea)
+// ATT: it may change 'name'
+ea_t get_name_ea_ex(qstring &name)
+{
+	ea_t ea = get_name_ea(BADADDR, name.c_str());
+	if(ea == BADADDR) {
+		if(name.replace("__", "::")) // from some version (9.??) IDA disables "::" in Var and Member names, and "::" is replaced it with "__"
+			ea = get_name_ea(BADADDR, name.c_str());
+	}
+	return ea;
+}
+
+ea_t get_call_dst(cfunc_t* cfunc, cexpr_t *call)
+{
+	if(call->op != cot_call)
+		return BADADDR;
+
+	ea_t dst_ea = BADADDR;
+	cexpr_t *callee = skipCast(call->x);
+
+	if(callee->op == cot_obj) {
+		flags64_t flg = get_flags(callee->obj_ea);
+		if(is_func(flg))
+			return callee->obj_ea;
+		if(is_data(flg)) {
+			dst_ea = get_ea(callee->obj_ea);
+			if(is_func(get_flags(dst_ea)))
+				return dst_ea;
+		}
+		// fall down to "last hope"
+	}
+
+	// jump to address in struct member-to-proc-xref (or by VT/comment/name)
+	if(callee->op == cot_memptr || callee->op == cot_memref) {
+		cexpr_t *e = callee;
+		int offset = e->m;
+		if (e->x->op == cot_idx)
+			e = e->x;
+		cexpr_t *var = e->x;
+		tinfo_t t = var->type;
+		if(t.is_ptr_or_array())
+			t.remove_ptr_or_array();
+		if(t.is_struct()) {
+#if IDA_SDK_VERSION < 850
+			qstring sname;
+			if(t.get_type_name(&sname)) {
+				tid_t sid = get_struc_id(sname.c_str());
+				if(sid != BADNODE) {
+					struc_t* s = get_struc(sid);
+					if(s) {
+						member_t *m = get_member(s, offset);
+						if(m)
+							dst_ea = get_memb2proc_ref(s, m);
+					}
+				}
+			}
+#else
+			dst_ea = get_memb2proc_ref(t, offset);
+#endif
+		}
+	}
+
+	if(dst_ea == BADADDR) {
+		//last hope, jump to name
+		qstring callname;
+		if(getExpName(cfunc, callee, &callname))
+			dst_ea = get_name_ea_ex(callname);
+	}
+	return dst_ea;
+}
+
+tinfo_t getCallInfo(cfunc_t* cfunc, cexpr_t *call, ea_t* dstea)
 {
 	tinfo_t tif;
-	if (call->x->op == cot_obj) {
-		*dstea = call->x->obj_ea;
+	*dstea = get_call_dst(cfunc, call);
+	if(*dstea != BADADDR)
 		get_tinfo(&tif, *dstea);
-	} else {
-		*dstea = BADADDR;
-	}
+
 	if (tif.empty()) {
 		tif = call->x->type;
 		if (tif.empty()) {
@@ -630,12 +700,14 @@ qstring printExp(const cfunc_t *func, cexpr_t *expr)
 	return sExp;
 }
 
-void printExp2Msg(const cfunc_t *func, cexpr_t *expr, const char* mesg)
+int LogExpr(LogLevel level, const cfunc_t *func, cexpr_t *expr, const char* mesg)
 {
+	if(level > cfg.logLevel)
+		return 0;
 	qstring SExp = printExp(func, expr);
 	qstring funcname;
 	get_short_name(&funcname, func->entry_ea);
-	Log(llInfo, "%a %s: %s '%s'\n", expr->ea, funcname.c_str(), mesg, SExp.c_str());
+	return Log(level, "%a %s: %s '%s'\n", expr->ea, funcname.c_str(), mesg, SExp.c_str());
 }
 
 void replaceExp(const cfunc_t *func, cexpr_t *expr, cexpr_t *newExp, bool clean)
@@ -729,3 +801,27 @@ int LogTail(LogLevel level, const char *fmt, ...)
 	va_end(va);
   return res;
 }
+
+//------------------------------------------------
+char* getPluginsFile(char *buf, size_t bufsize, const char *filename)
+{
+	char *res = getsysfile(buf, bufsize, filename, PLG_SUBDIR "/hrtng");
+	if(res)
+		return res;
+	return getsysfile(buf, bufsize, filename, PLG_SUBDIR);
+}
+
+//------------------------------------------------
+bool isFuncOrFuncptr(ea_t ea)
+{
+	flags64_t f = get_flags(ea);
+	if(is_func(f))
+		return true;
+	if(is_ea(f)) {
+		tinfo_t t;
+		if(get_tinfo(&t, ea) && t.is_funcptr())
+			return true;
+	}
+	return false;
+}
+
